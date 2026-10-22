@@ -92,7 +92,7 @@ static __global__ void count_differences_kernel(nk::tensor_view<f32_t, 1> actual
 }
 
 [[nodiscard]] static std::uint32_t blocks_for(std::size_t scalars) noexcept {
-    return static_cast<std::uint32_t>((scalars + block_threads_k - 1) / block_threads_k);
+    return static_cast<std::uint32_t>(divide_round_up(scalars, block_threads_k));
 }
 
 /** The minimum and median milliseconds per call of a timed run. */

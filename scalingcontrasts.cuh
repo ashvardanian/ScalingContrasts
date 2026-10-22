@@ -45,6 +45,11 @@ using f64_t = double;
 inline constexpr std::uint32_t block_threads_k = 256;
 inline constexpr f32_t cosine_floor_k = 1.0e-2f; // smaller norm products read as zero cosines
 
+/** The smallest count of @p divisor -sized pieces that covers @p value . */
+[[nodiscard]] constexpr std::size_t divide_round_up(std::size_t value, std::size_t divisor) noexcept {
+    return (value + divisor - 1) / divisor;
+}
+
 /** Ends the process with @p what when @p status failed: a benchmark has no recovery path. */
 inline void require(nk::status_t status, char const *what) noexcept {
     if (nk::succeeded(status)) return;
@@ -226,7 +231,7 @@ struct multimem_domain_t {
         require(cuMulticastGetGranularity(&multicast_granularity, &properties, CU_MULTICAST_GRANULARITY_MINIMUM),
                 "multicast granularity");
         std::size_t const granularity = std::max(allocation_granularity, multicast_granularity);
-        domain.stride = (properties.size + granularity - 1) / granularity * granularity;
+        domain.stride = divide_round_up(properties.size, granularity) * granularity;
         properties.size = domain.stride;
         require(cuMulticastCreate(&domain.multicast, &properties), "multicast creation");
         for (std::size_t member = 0; member != members; ++member)
@@ -296,7 +301,7 @@ struct multimem_domain_t {
     /** In place: the first @p scalars , a multiple of four, of every payload become their sum, each
      *  member reducing and broadcasting its own share. */
     void all_reduce(std::size_t member, std::size_t scalars, nk::stream_t const &stream) noexcept {
-        std::size_t const vectors = scalars / 4, share = (vectors + members - 1) / members;
+        std::size_t const vectors = scalars / 4, share = divide_round_up(vectors, members);
         std::size_t const begin = std::min(member * share, vectors) * 4,
                           end = std::min(member * share + share, vectors) * 4;
         barrier(member, stream);
@@ -315,7 +320,7 @@ struct multimem_domain_t {
         return {pointer_<f32_t>(multicast_base), payload_scalars};
     }
     [[nodiscard]] std::uint32_t blocks_(std::size_t scalars) const noexcept {
-        std::size_t const wanted = (scalars / 4 + block_threads_k - 1) / block_threads_k;
+        std::size_t const wanted = divide_round_up(scalars / 4, block_threads_k);
         return static_cast<std::uint32_t>(std::clamp<std::size_t>(wanted, 1, std::size_t(multiprocessors)));
     }
     [[nodiscard]] static CUdevice device_(std::size_t ordinal) noexcept {
@@ -603,44 +608,225 @@ static __global__ void prefix_norms_kernel(nk::tensor_view<bf16_t, 2> vertices, 
     }
 }
 
-/** One row of one subgraph tile: nested raw dots from the band products, every cell's sigmoid BCE,
- *  both directions' raw-dot gradients suffix-summed into BF16, and the row's summands added in
- *  subgraph order. */
-static __global__ void tile_kernel(nk::tensor_view<f32_t, 3> band_products, nk::tensor_view<f32_t, 2> row_norms,
-                                   nk::tensor_view<f32_t, 2> column_norms, nk::tensor_span<bf16_t, 3> gradient,
-                                   nk::tensor_span<f32_t, 2> scalars, nk::tensor_span<f32_t, 2> self_coefficients,
-                                   matryoshka_t ladder, std::size_t row_base, std::size_t column_base, f32_t beta,
-                                   f32_t bias, f32_t weight) {
-    std::size_t const row = blockIdx.x, columns = band_products.extent(2);
-    f32_t loss = 0.0f, bias_grad = 0.0f, log_beta_grad = 0.0f, coefficient[8] = {};
-    for (std::size_t column = threadIdx.x; column < columns; column += blockDim.x) {
-        bool const own_copy = row_base + row == column_base + column;
-        f32_t const target = own_copy ? 1.0f : -1.0f;
-        f32_t raw = 0.0f, raw_grad[8] = {};
-        for (std::uint32_t band = 0; band != ladder.count; ++band) {
-            raw += band_products[band, row, column];
-            f32_t const denominator = row_norms[band, row] * column_norms[band, column];
-            f32_t const logit = beta * (denominator > cosine_floor_k ? raw / denominator : 0.0f);
-            f32_t const signed_logit = target * (logit + bias);
-            f32_t const cell_grad = weight * target * (1.0f / (1.0f + expf(-signed_logit)) - 1.0f);
-            loss += weight * (fmaxf(-signed_logit, 0.0f) + log1pf(expf(-fabsf(signed_logit))));
-            bias_grad += cell_grad;
-            log_beta_grad += cell_grad * logit;
-            // The mirror cell (j, i) moves v_i the same way; a vertex's cosine with its own copy is
-            // constant.
-            raw_grad[band] = own_copy ? 0.0f : 2.0f * beta * cell_grad / fmaxf(denominator, cosine_floor_k);
-            coefficient[band] += raw_grad[band] * raw;
+inline constexpr std::uint32_t fused_side_k = 64;                // rows and columns of one fused tile
+inline constexpr std::uint32_t fused_warps_k = 4;                // each owns 16 rows of the tile
+inline constexpr std::uint32_t fused_pitch_k = fused_side_k + 8; // padded rows keep `ldmatrix` conflict-free
+
+using fused_stage_t = bf16_t[fused_side_k][fused_pitch_k];
+
+/** A fused tile's register state: each lane's 32 cells, as raw dots and running gradients, and
+ *  its two rows' summands. */
+struct fused_cells_t {
+    f32_t raw[8][4] = {}, running[8][4] = {};
+    f32_t loss[2] = {}, bias_grad[2] = {}, log_beta_grad[2] = {};
+};
+
+/** What every fused tile of one subgraph shares. */
+struct fused_tile_t {
+    nk::tensor_view<f32_t, 2> row_norms, column_norms;
+    nk::tensor_span<bf16_t, 3> gradient;
+    nk::tensor_span<f32_t, 3> partials;
+    std::size_t row_base, column_base;
+    f32_t beta, bias, weight;
+};
+
+[[nodiscard]] __device__ inline std::uint32_t shared_address_(void const *pointer) noexcept {
+    return static_cast<std::uint32_t>(__cvta_generic_to_shared(pointer));
+}
+
+/** The first row and column of this block's fused tile. */
+[[nodiscard]] __device__ inline std::size_t tile_row_() noexcept { return std::size_t {blockIdx.y} * fused_side_k; }
+[[nodiscard]] __device__ inline std::size_t tile_column_() noexcept { return std::size_t {blockIdx.x} * fused_side_k; }
+
+/** Starts copying the rows' @b [64,64] and the transposed columns' @b [64,64] at channel
+ *  @p depth . */
+__device__ inline void load_fused_stage_(fused_stage_t &rows, fused_stage_t &columns,
+                                         nk::tensor_view<bf16_t, 2> vertices, nk::tensor_view<bf16_t, 2> transposed,
+                                         fused_tile_t const &tile, std::size_t depth) noexcept {
+    for (std::uint32_t chunk = threadIdx.x; chunk < fused_side_k * fused_side_k / 8; chunk += blockDim.x) {
+        std::uint32_t const line = chunk / 8, part = chunk % 8 * 8;
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(shared_address_(&rows[line][part])),
+                     "l"(&vertices[tile_row_() + line, depth + part])
+                     : "memory");
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(shared_address_(&columns[line][part])),
+                     "l"(&transposed[depth + line, tile_column_() + part])
+                     : "memory");
+    }
+    asm volatile("cp.async.commit_group;" ::: "memory");
+}
+
+/** One k16 step of a warp's 16 rows against the stage's 64 columns into @p accumulator , the
+ *  rows' sign bits flipped by @p sign , which @c 0x80008000 negates exactly. */
+__device__ inline void multiply_fused_step_(fused_stage_t const &rows, fused_stage_t const &columns, std::uint32_t step,
+                                            std::uint32_t sign, f32_t (&accumulator)[8][4]) noexcept {
+    std::uint32_t const lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    std::uint32_t a[4];
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 " //
+                 "{%0, %1, %2, %3}, [%4];"                   //
+                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+                 : "r"(shared_address_(&rows[warp * 16 + lane % 16][step * 16 + lane / 16 * 8])));
+#pragma unroll
+    for (std::uint32_t &word : a) word ^= sign;
+#pragma unroll
+    for (std::uint32_t pair = 0; pair != 4; ++pair) {
+        std::uint32_t b[4];
+        asm volatile(
+            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 " //
+            "{%0, %1, %2, %3}, [%4];"                         //
+            : "=r"(b[0]), "=r"(b[1]), "=r"(b[2]), "=r"(b[3])
+            : "r"(shared_address_(&columns[step * 16 + lane % 8 + lane / 8 % 2 * 8][pair * 16 + lane / 16 * 8])));
+#pragma unroll
+        for (std::uint32_t half = 0; half != 2; ++half) {
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 " //
+                         "{%0, %1, %2, %3}, "                                   //
+                         "{%4, %5, %6, %7}, "                                   //
+                         "{%8, %9}, "                                           //
+                         "{%0, %1, %2, %3};"                                    //
+                         : "+f"(accumulator[pair * 2 + half][0]), "+f"(accumulator[pair * 2 + half][1]),
+                           "+f"(accumulator[pair * 2 + half][2]), "+f"(accumulator[pair * 2 + half][3])
+                         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[half * 2]), "r"(b[half * 2 + 1]));
         }
-        f32_t suffix = 0.0f;
-        for (std::uint32_t band = ladder.count; band-- != 0;)
-            suffix += raw_grad[band], gradient[band, row, column] = __float2bfloat16(suffix);
     }
-    loss = block_sum(loss), bias_grad = block_sum(bias_grad), log_beta_grad = block_sum(log_beta_grad);
-    for (std::uint32_t band = 0; band != ladder.count; ++band) {
-        f32_t const total = block_sum(coefficient[band]);
-        if (threadIdx.x == 0) self_coefficients[band, row] += total;
+}
+
+/** Scores @p band from the cells' raw dots, adds its gradient to the running suffix, and writes
+ *  that suffix through @p gradient_stage in 16-byte rows, with the band's coefficient partials. */
+__device__ inline void score_fused_band_(fused_cells_t &cells, fused_tile_t const &tile, fused_stage_t &gradient_stage,
+                                         std::uint32_t band) noexcept {
+    std::uint32_t const lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    f32_t coefficient[2] = {};
+#pragma unroll
+    for (std::uint32_t column_group = 0; column_group != 8; ++column_group)
+#pragma unroll
+        for (std::uint32_t element = 0; element != 4; ++element) {
+            std::uint32_t const slot = element / 2;
+            std::uint32_t const local_row = warp * 16 + lane / 4 + slot * 8;
+            std::uint32_t const local_column = column_group * 8 + lane % 4 * 2 + element % 2;
+            std::size_t const row = tile_row_() + local_row, column = tile_column_() + local_column;
+            bool const own_copy = tile.row_base + row == tile.column_base + column;
+            f32_t const raw = cells.raw[column_group][element];
+            f32_t const denominator = tile.row_norms[band, row] * tile.column_norms[band, column];
+            f32_t const cosine = denominator > cosine_floor_k ? __fdividef(raw, denominator) : 0.0f;
+            // A vertex's cosine with its own copy is one, whatever its raw dot rounds to.
+            f32_t const logit = tile.beta * (own_copy ? 1.0f : cosine);
+            f32_t const target = own_copy ? 1.0f : -1.0f;
+            f32_t const signed_logit = target * (logit + tile.bias);
+            f32_t const decay = __expf(-fabsf(signed_logit));
+            f32_t const complement = __fdividef(signed_logit >= 0.0f ? decay : 1.0f, 1.0f + decay); // 1 - sigmoid
+            f32_t const cell_grad = -tile.weight * target * complement;
+            cells.loss[slot] += tile.weight * (fmaxf(-signed_logit, 0.0f) + log1pf(decay));
+            cells.bias_grad[slot] += cell_grad;
+            cells.log_beta_grad[slot] += cell_grad * logit;
+            // The mirror cell (j, i) moves v_i the same way, and the own copy moves nothing.
+            f32_t const raw_grad = own_copy
+                                       ? 0.0f
+                                       : __fdividef(2.0f * tile.beta * cell_grad, fmaxf(denominator, cosine_floor_k));
+            coefficient[slot] += raw_grad * raw;
+            cells.running[column_group][element] += raw_grad;
+            gradient_stage[local_row][local_column] = __float2bfloat16(cells.running[column_group][element]);
+        }
+#pragma unroll
+    for (std::uint32_t slot = 0; slot != 2; ++slot) {
+#pragma unroll
+        for (std::uint32_t offset = 1; offset != 4; offset *= 2)
+            coefficient[slot] += __shfl_xor_sync(0xFFFFFFFFu, coefficient[slot], offset);
+        std::size_t const row = tile_row_() + warp * 16 + lane / 4 + slot * 8;
+        if (lane % 4 == 0) tile.partials[3 + band, row, blockIdx.x] = coefficient[slot];
     }
-    if (threadIdx.x == 0) scalars[0, row] += loss, scalars[1, row] += bias_grad, scalars[2, row] += log_beta_grad;
+    __syncthreads();
+    for (std::uint32_t chunk = threadIdx.x; chunk < fused_side_k * fused_side_k / 8; chunk += blockDim.x) {
+        std::uint32_t const line = chunk / 8, part = chunk % 8 * 8;
+        std::uint32_t x, y, z, w;
+        asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];"
+                     : "=r"(x), "=r"(y), "=r"(z), "=r"(w)
+                     : "r"(shared_address_(&gradient_stage[line][part])));
+        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" ::"l"(
+                         &tile.gradient[band, tile_row_() + line, tile_column_() + part]),
+                     "r"(x), "r"(y), "r"(z), "r"(w)
+                     : "memory");
+    }
+    __syncthreads();
+}
+
+/**
+ *  @brief One @b [64,64] tile of a subgraph, scored at every Matryoshka prefix, with no Float32
+ *      @b [K,R,R] stash.
+ *
+ *  A forward sweep over the depth gives every cell's full raw dot. A reverse sweep with negated
+ *  rows then takes the suffix back off, meeting the band edges widest first, so each band's
+ *  suffix-summed gradient needs one running register per cell. Row summands land in the tile's
+ *  @b [3+K,R,R/64] partials per column tile, which @ref fold_partials_kernel adds in order.
+ */
+static __global__ void matryoshka_tile_kernel(nk::tensor_view<bf16_t, 2> vertices,
+                                              nk::tensor_view<bf16_t, 2> transposed, fused_tile_t const tile,
+                                              matryoshka_t ladder) {
+    __shared__ alignas(16) fused_stage_t rows_stages[2], columns_stages[2], gradient_stage;
+    std::uint32_t const lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    std::uint32_t const stages = static_cast<std::uint32_t>(vertices.extent(1) / fused_side_k);
+    std::uint32_t const reversed = ladder.count > 1 ? stages - ladder.ends[0] / fused_side_k : 0;
+    std::uint32_t const positions = stages + reversed;
+    fused_cells_t cells;
+
+    // Forward positions take stages in order, reverse ones from the last to the narrowest band's.
+    auto const depth_of = [&](std::uint32_t position) {
+        return std::size_t {position < stages ? position : 2 * stages - 1 - position} * fused_side_k;
+    };
+    std::uint32_t band = ladder.count - 1;
+    load_fused_stage_(rows_stages[0], columns_stages[0], vertices, transposed, tile, depth_of(0));
+    for (std::uint32_t position = 0; position != positions; ++position) {
+        std::uint32_t const buffer = position % 2;
+        if (position + 1 != positions)
+            load_fused_stage_(rows_stages[1 - buffer], columns_stages[1 - buffer], vertices, transposed, tile,
+                              depth_of(position + 1));
+        if (position + 1 != positions) asm volatile("cp.async.wait_group 1;" ::: "memory");
+        else asm volatile("cp.async.wait_group 0;" ::: "memory");
+        __syncthreads();
+        if (position < stages) {
+#pragma unroll
+            for (std::uint32_t step = 0; step != fused_side_k / 16; ++step)
+                multiply_fused_step_(rows_stages[buffer], columns_stages[buffer], step, 0, cells.raw);
+        }
+        else {
+#pragma unroll
+            for (std::uint32_t backwards = 0; backwards != fused_side_k / 16; ++backwards) {
+                std::uint32_t const step = fused_side_k / 16 - 1 - backwards;
+                multiply_fused_step_(rows_stages[buffer], columns_stages[buffer], step, 0x80008000u, cells.raw);
+                if (band && depth_of(position) + step * 16 == ladder.ends[band - 1])
+                    score_fused_band_(cells, tile, gradient_stage, --band);
+            }
+        }
+        __syncthreads();
+        if (position + 1 == stages) score_fused_band_(cells, tile, gradient_stage, band);
+    }
+
+#pragma unroll
+    for (std::uint32_t slot = 0; slot != 2; ++slot) {
+#pragma unroll
+        for (std::uint32_t offset = 1; offset != 4; offset *= 2) {
+            cells.loss[slot] += __shfl_xor_sync(0xFFFFFFFFu, cells.loss[slot], offset);
+            cells.bias_grad[slot] += __shfl_xor_sync(0xFFFFFFFFu, cells.bias_grad[slot], offset);
+            cells.log_beta_grad[slot] += __shfl_xor_sync(0xFFFFFFFFu, cells.log_beta_grad[slot], offset);
+        }
+        std::size_t const row = tile_row_() + warp * 16 + lane / 4 + slot * 8;
+        if (lane % 4 != 0) continue;
+        tile.partials[0, row, blockIdx.x] = cells.loss[slot];
+        tile.partials[1, row, blockIdx.x] = cells.bias_grad[slot];
+        tile.partials[2, row, blockIdx.x] = cells.log_beta_grad[slot];
+    }
+}
+
+/** Adds each row's column-tile @p partials , in tile order, to its @p scalars and
+ *  @p self_coefficients . */
+static __global__ void fold_partials_kernel(nk::tensor_view<f32_t, 3> partials, nk::tensor_span<f32_t, 2> scalars,
+                                            nk::tensor_span<f32_t, 2> self_coefficients) {
+    std::size_t const row = blockIdx.x * std::size_t {blockDim.x} + threadIdx.x;
+    if (row >= partials.extent(1)) return;
+    for (std::size_t quantity = 0; quantity != partials.extent(0); ++quantity) {
+        f32_t total = 0.0f;
+        for (std::size_t tile = 0; tile != partials.extent(2); ++tile) total += partials[quantity, row, tile];
+        if (quantity < 3) scalars[quantity, row] += total;
+        else self_coefficients[quantity - 3, row] += total;
+    }
 }
 
 static __global__ void add_kernel(nk::tensor_view<f32_t, 2> addend, nk::tensor_span<f32_t, 2> accumulator) {
@@ -696,7 +882,7 @@ struct streamed_loss_t {
     std::size_t rows = 0, hidden = 0;
     nk_capability_t capabilities = 0;
     nk::tensor<f32_t, nk::allocator<f32_t>, 2> row_norms, column_norms, products, forces, scalars, self_coefficients;
-    nk::tensor<f32_t, nk::allocator<f32_t>, 3> band_products;
+    nk::tensor<f32_t, nk::allocator<f32_t>, 3> partials;
     nk::tensor<bf16_t, nk::allocator<bf16_t>, 3> gradient;
     nk::tensor<bf16_t, nk::allocator<bf16_t>, 2> transposed;
     nk::tensor<byte_t, nk::allocator<byte_t>, 1> packed, workspace;
@@ -707,19 +893,21 @@ struct streamed_loss_t {
         loss.ladder = ladder, loss.rows = rows, loss.hidden = hidden;
         loss.capabilities = take(device.capabilities_enabled(), "capability query");
         std::size_t const k = ladder.count;
+        bool const edges_fit = std::all_of(ladder.ends, ladder.ends + k,
+                                           [](std::uint32_t end) { return end % 16 == 0; });
+        require(rows % fused_side_k == 0 && hidden % fused_side_k == 0 && edges_fit && ladder.ends[k - 1] == hidden
+                    ? 0
+                    : EINVAL,
+                "fused tile shape, which takes rows and channels in multiples of 64 and band edges in 16");
         // a zero-byte tensor would read as a failed allocation
         std::size_t pack_bytes = 1, workspace_bytes = 1;
         for (std::uint32_t band = 0; band != k; ++band) {
             std::size_t const width = ladder.width(band);
-            pack_bytes = std::max({pack_bytes,
-                                   take(nk::dots_pack_size<nk::bf16_t>(rows, width, loss.capabilities), "pack size"),
-                                   take(nk::dots_pack_size<nk::bf16_t>(width, rows, loss.capabilities), "pack size")});
+            pack_bytes = std::max(pack_bytes,
+                                  take(nk::dots_pack_size<nk::bf16_t>(width, rows, loss.capabilities), "pack size"));
             workspace_bytes = std::max(
-                {workspace_bytes,
-                 take(nk::dots_packed_workspace_size<nk::bf16_t>(rows, rows, width, loss.capabilities),
-                      "workspace size"),
-                 take(nk::dots_packed_workspace_size<nk::bf16_t>(rows, width, rows, loss.capabilities),
-                      "workspace size")});
+                workspace_bytes, take(nk::dots_packed_workspace_size<nk::bf16_t>(rows, width, rows, loss.capabilities),
+                                      "workspace size"));
         }
         loss.row_norms = make_tensor<f32_t, 2>(loss.capabilities, stream, {k, rows});
         loss.column_norms = make_tensor<f32_t, 2>(loss.capabilities, stream, {k, rows});
@@ -727,7 +915,7 @@ struct streamed_loss_t {
         loss.forces = make_tensor<f32_t, 2>(loss.capabilities, stream, {rows, hidden});
         loss.scalars = make_tensor<f32_t, 2>(loss.capabilities, stream, {3, rows});
         loss.self_coefficients = make_tensor<f32_t, 2>(loss.capabilities, stream, {k, rows});
-        loss.band_products = make_tensor<f32_t, 3>(loss.capabilities, stream, {k, rows, rows});
+        loss.partials = make_tensor<f32_t, 3>(loss.capabilities, stream, {3 + k, rows, rows / fused_side_k});
         loss.gradient = make_tensor<bf16_t, 3>(loss.capabilities, stream, {k, rows, rows});
         loss.transposed = make_tensor<bf16_t, 2>(loss.capabilities, stream, {hidden, rows});
         loss.packed = make_tensor<byte_t, 1>(loss.capabilities, stream, {pack_bytes});
@@ -738,7 +926,7 @@ struct streamed_loss_t {
     /** Device bytes the loss holds, independent of the world's size. */
     [[nodiscard]] std::size_t bytes() const noexcept {
         return (row_norms.numel() + column_norms.numel() + products.numel() + forces.numel() + scalars.numel() +
-                self_coefficients.numel() + band_products.numel()) *
+                self_coefficients.numel() + partials.numel()) *
                    sizeof(f32_t) +
                (gradient.numel() + transposed.numel()) * sizeof(bf16_t) + packed.numel() + workspace.numel();
     }
@@ -759,17 +947,19 @@ struct streamed_loss_t {
         launch(&prefix_norms_kernel, rows, block_threads_k, stream, subgraph, column_norms.span(), ladder);
         dim3 const transpose_grid {static_cast<std::uint32_t>(hidden / 32), static_cast<std::uint32_t>(rows / 32)};
         launch(&transpose_kernel, transpose_grid, dim3 {32, 8}, stream, subgraph, transposed.span());
-        for (std::uint32_t band = 0; band != ladder.count; ++band)
-            multiply_(vertices.data() + ladder.begin(band), hidden, subgraph.data() + ladder.begin(band), hidden,
-                      band_products.data() + band * rows * rows, rows, rows, rows, ladder.width(band), stream);
-        launch(&tile_kernel, rows, block_threads_k, stream, band_products.view(), row_norms.view(), column_norms.view(),
-               gradient.span(), scalars.span(), self_coefficients.span(), ladder, row_base, column_base, beta, bias,
-               1.0f / live);
+        std::uint32_t const tiles = static_cast<std::uint32_t>(rows / fused_side_k);
+        fused_tile_t const tile {
+            row_norms.view(), column_norms.view(), gradient.span(), partials.span(), row_base, column_base, beta, bias,
+            1.0f / live};
+        launch(&matryoshka_tile_kernel, dim3 {tiles, tiles}, fused_warps_k * 32, stream, vertices, transposed.view(),
+               tile, ladder);
+        launch(&fold_partials_kernel, divide_round_up(rows, block_threads_k), block_threads_k, stream, partials.view(),
+               scalars.span(), self_coefficients.span());
         for (std::uint32_t band = 0; band != ladder.count; ++band)
             multiply_(gradient.data() + band * rows * rows, rows, transposed.data() + ladder.begin(band) * rows, rows,
                       products.data() + ladder.begin(band), hidden, rows, ladder.width(band), rows, stream);
-        launch(&add_kernel, (rows * hidden + block_threads_k - 1) / block_threads_k, block_threads_k, stream,
-               products.view(), forces.span());
+        launch(&add_kernel, divide_round_up(rows * hidden, block_threads_k), block_threads_k, stream, products.view(),
+               forces.span());
     }
 
     /** Writes the BF16 @p gradient_out and the three @p summands , a multimem payload or any device

@@ -19,6 +19,9 @@ Every number below comes from this repository, on one or two 8× B300 SXM6 boxes
 - __RDMA rails.__
   Each GPU owns one RoCE port and an RC queue pair to the same GPU on every other host, writing its embeddings from GPU memory straight into GPU memory, registered as dma-buf.
   The landed embeddings are double-buffered by step parity and read in place by the host's other GPUs over NVLink, so each crosses the wire once.
+- __Matryoshka in one product.__
+  A `mma.sync` tensor-core kernel sweeps the depth forward for every cell's full dot, then back with negated rows, meeting the band edges widest first.
+  Each band's gradient is scored and suffix-summed in registers as it is met, so no Float32 `[K, R, R]` of products ever reaches memory.
 - __Streamed, row-owned sigmoid loss.__
   Each peer's `[K, R, R]` tile of Matryoshka cosines is scored, lossed and folded into the GPU's own forces before the next one, so memory does not grow with the world.
   Cell `(i, j)` and its mirror `(j, i)` share the cosine, target and weight, so the owner of `i` differentiates both, and the backward exchanges nothing.
@@ -33,31 +36,34 @@ The baseline is open_clip 3.3.0's `SigLipLoss` with its bidirectional neighbour 
 Times are the minimum of 10 windows of back-to-back steps.
 Memory is the loss's own allocation, or PyTorch's peak above its inputs.
 
-| 8 GPUs          | Streamed | PyTorch |
-| :-------------- | -------: | ------: |
-| R = 1024 step   |  7.31 ms | 26.2 ms |
-| R = 1024 memory |    60 MB |  241 MB |
-| R = 4096 step   |  12.8 ms | 26.9 ms |
-| R = 4096 memory |   567 MB | 3.03 GB |
+| 8 GPUs           | Streamed | PyTorch |
+| :--------------- | -------: | ------: |
+| R = 1024 step    |  4.58 ms | 26.2 ms |
+| R = 1024 memory  |    39 MB |  241 MB |
+| R = 4096 step    |  11.4 ms | 26.9 ms |
+| R = 4096 memory  |   239 MB | 3.03 GB |
+| R = 16384 step   |   121 ms |         |
+| R = 16384 memory |  3.00 GB |         |
 
 Across two such boxes, one process per box and eight 100 Gb/s RoCE rails between them:
 
-| 16 GPUs         | Streamed | PyTorch |
-| :-------------- | -------: | ------: |
-| R = 1024 step   |  15.8 ms | 47.3 ms |
-| R = 1024 memory |    64 MB |  474 MB |
-| R = 4096 step   |  27.6 ms | 53.1 ms |
-| R = 4096 memory |   583 MB | 5.97 GB |
+| 16 GPUs          | Streamed | PyTorch |
+| :--------------- | -------: | ------: |
+| R = 1024 step    |  9.98 ms | 47.3 ms |
+| R = 1024 memory  |    44 MB |  474 MB |
+| R = 4096 step    |  23.9 ms | 53.1 ms |
+| R = 4096 memory  |   256 MB | 5.97 GB |
+| R = 16384 step   |   241 ms |         |
+| R = 16384 memory |  3.07 GB |         |
 
 Each GPU scores its host's eight towers while the other host's eight are in flight, then scores those once they land.
 The memory adds the two landings per GPU to the loss's own tile.
-At R = 4096 every tile reads its peer's tower about seven times over NVLink, once per band and twice more for norms and the transpose, which a one-pass Matryoshka product would cut.
 
-One rank of a 72-GPU world, simulated on one GPU at R = 4096, takes 77.2 ms and 567 MB.
+One rank of a 72-GPU world, simulated on one GPU at R = 4096, takes 85.7 ms and 239 MB.
 PyTorch's simulated rank takes 101 ms and 26.6 GB in BF16.
-The streamed loss holds the same 567 MB at 8, 72 or 144 GPUs.
+The streamed loss holds the same 239 MB at 8, 72 or 144 GPUs.
 
-Against a Float64 evaluation of the whole 8-GPU world at R = 64, the loss matches to 5e-7 relative, and the gradient to 0.24% relative L2, the BF16 rounding of its operands.
+Against a Float64 evaluation of the whole 8-GPU world at R = 64, the loss matches to 5e-8 relative, and the gradient to 0.24% relative L2, the BF16 rounding of its operands.
 The summands reach every GPU through one multimem all-reduce, and every GPU holds the same loss.
 Across two hosts, both check the 16-GPU world at R = 64 to the same precision, and agree on the loss bit for bit, as each adds the hosts' summands in host order.
 
@@ -84,24 +90,24 @@ NCCL is 2.30.7, the one PyTorch bundles, under nccl-tests v2.21.1 with NVLink SH
 Build with CMake, which fetches NumKong:
 
 ```sh
-cmake -B build -D CMAKE_BUILD_TYPE=Release
-cmake --build build
+cmake -B build_release -D CMAKE_BUILD_TYPE=Release
+cmake --build build_release
 ```
 
 The binary prints one CSV row per measurement:
 
 ```sh
-build/scalingcontrasts oracle --rows 64               # every local GPU against a Float64 evaluation
-build/scalingcontrasts box --rows 4096                # every local GPU, peers read in place
-build/scalingcontrasts simulate --rows 4096 --world 72
-build/scalingcontrasts collectives --max-mib 128
+build_release/scalingcontrasts oracle --rows 64   # every local GPU against a Float64 evaluation
+build_release/scalingcontrasts box --rows 4096    # every local GPU, peers read in place
+build_release/scalingcontrasts simulate --rows 4096 --world 72
+build_release/scalingcontrasts collectives --max-mib 128
 ```
 
 Across hosts, every host runs one process, naming its index, one NIC per local GPU, and a directory all hosts share for the rendezvous, fresh for every run:
 
 ```sh
-build/scalingcontrasts hosts --rows 4096 --host 0 --hosts 2 --nics <nic0>,<nic1>,... --exchange <shared directory>
-build/scalingcontrasts oracle --rows 64 --host 0 --hosts 2 --nics <nic0>,<nic1>,... --exchange <shared directory>
+build_release/scalingcontrasts hosts --rows 4096 --host 0 --hosts 2 --nics <nic0>,<nic1>,... --exchange <shared directory>
+build_release/scalingcontrasts oracle --rows 64 --host 0 --hosts 2 --nics <nic0>,<nic1>,... --exchange <shared directory>
 ```
 
 The baseline runs under `uv` or any environment with PyTorch and open_clip:
