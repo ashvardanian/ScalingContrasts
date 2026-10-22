@@ -1,0 +1,20 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "release",
+      "displayName": "Release - every benchmark",
+      "description": "Ninja, Clang as the host compiler, a build tree named after the preset. Point NumKong at a local checkout in a CMakeUserPresets.json on top.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build_${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_CUDA_HOST_COMPILER": "clang++"
+      }
+    }
+  ]
+}

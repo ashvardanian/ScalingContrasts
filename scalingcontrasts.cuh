@@ -1,0 +1,550 @@
+/**
+ *  @file scalingcontrasts.cuh
+ *  @author Ash Vardanian
+ *  @date October 22, 2026
+ *  @brief Direct NVLink scale-up primitives for training, and a contrastive loss built on them.
+ *
+ *  A contrastive loss scores every vertex of a batch against every other one, so its batch, and with it the
+ *  number of negatives each pair learns from, is bounded by how cheaply GPUs can see each other's vertices.
+ *  This header holds the pieces that keep that cheap: a streamed, row-owned sigmoid loss whose memory does not
+ *  grow with the world and whose backward exchanges nothing.
+ */
+#pragma once
+
+#include <cstddef> // `std::size_t`
+#include <cstdint> // `std::uint32_t`
+#include <cstdio>  // `std::fprintf`
+#include <cstdlib> // `std::exit`
+
+#include <algorithm> // `std::max`, `std::clamp`
+#include <span>      // `std::span`
+#include <tuple>     // `std::tuple`, `std::apply`
+#include <utility>   // `std::exchange`
+
+#include <cuda.h>         // `cuMulticastCreate`, `cuMulticastBindMem`, `cuMemMap`, `cuMemSetAccess`
+#include <cuda_bf16.h>    // `__nv_bfloat16`
+#include <cuda_runtime.h> // `cudaStream_t`, `cudaMemsetAsync`
+
+#include <numkong/numkong.hpp> // `nk::tensor`, `nk::allocator`, `nk::dots_pack`, `nk::dots_packed`
+
+namespace ashvardanian::scalingcontrasts {
+
+namespace nk = ashvardanian::numkong;
+
+using bf16_t = __nv_bfloat16;
+using byte_t = std::byte;
+using f32_t = float;
+using f64_t = double;
+
+inline constexpr std::uint32_t block_threads_k = 256;
+inline constexpr f32_t cosine_floor_k = 1.0e-2f; // smaller norm products read as zero cosines
+
+/** Ends the process with @p what when @p status failed: a benchmark has no recovery path. */
+inline void require(nk::status_t status, char const *what) noexcept {
+    if (nk::succeeded(status)) return;
+    std::fprintf(stderr, "%s failed: %s\n", what, nk::status_name(status));
+    std::exit(1);
+}
+
+inline void require(cudaError_t error, char const *what) noexcept {
+    if (error == cudaSuccess) return;
+    std::fprintf(stderr, "%s failed: %s\n", what, cudaGetErrorString(error));
+    std::exit(1);
+}
+
+[[nodiscard]] inline cudaStream_t cuda_stream(nk::stream_t const &stream) noexcept {
+    return reinterpret_cast<cudaStream_t>(stream.get());
+}
+
+/** Launches @p kernel on @p stream with @p arguments copied by value, and checks that it launched.
+ *  No triple chevrons: https://ashvardanian.com/posts/less-wrong-cuda-hello-world/ */
+template <typename... parameter_types_, typename... argument_types_>
+void launch(void (*kernel)(parameter_types_...), dim3 grid, dim3 block, nk::stream_t const &stream,
+            argument_types_ &&...arguments) noexcept {
+    std::tuple<parameter_types_...> values {std::forward<argument_types_>(arguments)...};
+    void *addresses[sizeof...(parameter_types_)];
+    std::apply(
+        [&](auto &...value) {
+            std::size_t index = 0;
+            ((addresses[index++] = &value), ...);
+        },
+        values);
+    require(cudaLaunchKernel(reinterpret_cast<void const *>(kernel), grid, block, addresses, 0, cuda_stream(stream)),
+            "kernel launch");
+}
+
+/** The value of a NumKong factory, or the end of the process. */
+template <typename value_type_>
+[[nodiscard]] value_type_ take(nk::expected<value_type_> &&made, char const *what) noexcept {
+    require(made.status, what);
+    return std::move(made.value);
+}
+
+/** A tensor of @p extents from NumKong's @p initialize policy bound to @p stream: allocated on the stream's
+ *  device and freed in its order, as device, pinned or unified memory. */
+template <typename value_type_, std::size_t rank_>
+[[nodiscard]] nk::tensor<value_type_, nk::allocator<value_type_>, rank_> make_tensor(
+    nk_capability_t capabilities, nk::stream_t const &stream, std::initializer_list<std::size_t> extents,
+    nk_status_t (*initialize)(nk_allocator_t *, nk_capability_t) = nk_allocator_init_device_best) noexcept {
+    return take(
+        nk::tensor<value_type_, nk::allocator<value_type_>, rank_>::uninitialized(
+            extents, take(nk::allocator<value_type_>::make(capabilities, stream.get(), initialize), "allocator")),
+        "allocation");
+}
+
+/** The Matryoshka ladder, ascending prefix widths; band @c b covers the channels @b [begin(b),ends[b]). */
+struct matryoshka_t {
+    std::uint32_t count = 0;
+    std::uint32_t ends[8] = {};
+
+    [[nodiscard]] __host__ __device__ std::uint32_t begin(std::uint32_t band) const noexcept {
+        return band == 0 ? 0 : ends[band - 1];
+    }
+    [[nodiscard]] __host__ __device__ std::uint32_t width(std::uint32_t band) const noexcept {
+        return ends[band] - begin(band);
+    }
+
+    /** @p count halvings of @p hidden , narrowest first. */
+    [[nodiscard]] static matryoshka_t halvings(std::uint32_t hidden, std::uint32_t count) noexcept {
+        matryoshka_t ladder;
+        ladder.count = count;
+        for (std::uint32_t prefix = 0; prefix != count; ++prefix) ladder.ends[prefix] = hidden >> (count - 1 - prefix);
+        return ladder;
+    }
+};
+
+/** Adds this member's arrival to every replica's flag, waits on its own flag for the round's last arrival, and
+ *  advances its own round, so the counters never reset. */
+static __global__ void multimem_barrier_kernel(std::uint32_t *multicast_flag, std::uint32_t *own_flag,
+                                               std::uint32_t *own_round, std::uint32_t members) {
+    std::uint32_t const target = *own_round + members;
+    asm volatile("multimem.red.release.sys.global.add.u32 [%0], %1;" ::"l"(multicast_flag), "r"(1u) : "memory");
+    std::uint32_t arrived = 0;
+    do asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(arrived) : "l"(own_flag) : "memory");
+    while (static_cast<std::int32_t>(arrived - target) < 0); // wrap-safe past 2³² arrivals
+    *own_round = target;
+}
+
+/** @c own[i]=Σ(members)payload[i] over @b [begin,end), one switch-reduced load per four scalars. */
+static __global__ void multimem_reduce_scatter_kernel(nk::tensor_view<f32_t, 1> multicast,
+                                                      nk::tensor_span<f32_t, 1> own, std::size_t begin,
+                                                      std::size_t end) {
+    for (std::size_t scalar = begin + 4 * (blockIdx.x * std::size_t {blockDim.x} + threadIdx.x); scalar < end;
+         scalar += 4 * std::size_t {gridDim.x} * blockDim.x) {
+        f32_t x, y, z, w;
+        asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.f32 {%0, %1, %2, %3}, [%4];"
+                     : "=f"(x), "=f"(y), "=f"(z), "=f"(w)
+                     : "l"(&multicast[scalar])
+                     : "memory");
+        asm volatile("st.global.v4.f32 [%0], {%1, %2, %3, %4};" ::"l"(&own[scalar]), "f"(x), "f"(y), "f"(z), "f"(w)
+                     : "memory");
+    }
+}
+
+/** @c payload[i]=Σ(members)payload[i] over @b [begin,end) on every replica: one switch-reduced load and one
+ *  multicast store per four scalars. */
+static __global__ void multimem_all_reduce_kernel(nk::tensor_span<f32_t, 1> multicast, std::size_t begin,
+                                                  std::size_t end) {
+    for (std::size_t scalar = begin + 4 * (blockIdx.x * std::size_t {blockDim.x} + threadIdx.x); scalar < end;
+         scalar += 4 * std::size_t {gridDim.x} * blockDim.x) {
+        f32_t x, y, z, w;
+        asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.f32 {%0, %1, %2, %3}, [%4];"
+                     : "=f"(x), "=f"(y), "=f"(z), "=f"(w)
+                     : "l"(&multicast[scalar])
+                     : "memory");
+        asm volatile("multimem.st.relaxed.sys.global.v4.f32 [%0], {%1, %2, %3, %4};" ::"l"(&multicast[scalar]), "f"(x),
+                     "f"(y), "f"(z), "f"(w)
+                     : "memory");
+    }
+}
+
+inline void require(CUresult result, char const *what) noexcept {
+    if (result == CUDA_SUCCESS) return;
+    char const *name = nullptr;
+    [[maybe_unused]] CUresult const named = cuGetErrorName(result, &name);
+    std::fprintf(stderr, "%s failed: %s\n", what, name ? name : "an unnamed driver error");
+    std::exit(1);
+}
+
+/**
+ *  @brief One host's GPUs as an NVLink multicast domain: a replica per GPU, all bound into one multicast object
+ *      that any of them addresses to reduce in the switch or to store into every replica at once.
+ *
+ *  A replica holds @ref payload_scalars scalars, then its arrival flag and its barrier round. Only its own GPU
+ *  reads the round, so barriers advance with no host writes. Every call enqueues on @p member 's stream, with
+ *  that member's device current.
+ */
+struct multimem_domain_t {
+    std::size_t members = 0, payload_scalars = 0, stride = 0;
+    int multiprocessors = 0;
+    CUmemGenericAllocationHandle multicast = 0;
+    CUdeviceptr multicast_base = 0, replicas_base = 0;
+
+    multimem_domain_t() noexcept = default;
+    multimem_domain_t(multimem_domain_t const &) = delete;
+    multimem_domain_t(multimem_domain_t &&other) noexcept
+        : members(other.members), payload_scalars(other.payload_scalars), stride(other.stride),
+          multiprocessors(other.multiprocessors), multicast(std::exchange(other.multicast, 0)),
+          multicast_base(other.multicast_base), replicas_base(other.replicas_base) {}
+
+    ~multimem_domain_t() noexcept {
+        if (!multicast) return;
+        require(cuMemUnmap(multicast_base, stride), "multicast unmapping");
+        require(cuMemAddressFree(multicast_base, stride), "multicast reservation release");
+        for (std::size_t member = 0; member != members; ++member)
+            require(cuMulticastUnbind(multicast, device_(member), 0, stride), "multicast unbinding");
+        require(cuMemUnmap(replicas_base, members * stride), "replica unmapping");
+        require(cuMemAddressFree(replicas_base, members * stride), "replica reservation release");
+        require(cuMemRelease(multicast), "multicast release");
+    }
+
+    /** Binds a zeroed replica of @p payload_scalars, a multiple of four, on each of the first @p members GPUs. */
+    [[nodiscard]] static multimem_domain_t make(std::size_t members, std::size_t payload_scalars) noexcept {
+        multimem_domain_t domain;
+        domain.members = members, domain.payload_scalars = payload_scalars;
+        CUmemAllocationProp allocation {};
+        allocation.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        allocation.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        allocation.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+        CUmulticastObjectProp properties {};
+        properties.numDevices = static_cast<unsigned>(members);
+        properties.handleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+        properties.size = (payload_scalars + 4) * sizeof(f32_t); // the payload, then the flag and the round
+        std::size_t allocation_granularity = 0, multicast_granularity = 0;
+        require(cuMemGetAllocationGranularity(&allocation_granularity, &allocation, CU_MEM_ALLOC_GRANULARITY_MINIMUM),
+                "allocation granularity");
+        require(cuMulticastGetGranularity(&multicast_granularity, &properties, CU_MULTICAST_GRANULARITY_MINIMUM),
+                "multicast granularity");
+        std::size_t const granularity = std::max(allocation_granularity, multicast_granularity);
+        domain.stride = (properties.size + granularity - 1) / granularity * granularity;
+        properties.size = domain.stride;
+        require(cuMulticastCreate(&domain.multicast, &properties), "multicast creation");
+        for (std::size_t member = 0; member != members; ++member)
+            require(cuMulticastAddDevice(domain.multicast, device_(member)), "multicast device addition");
+        require(cuMemAddressReserve(&domain.replicas_base, members * domain.stride, 0, 0, 0), "replica reservation");
+        for (std::size_t member = 0; member != members; ++member) {
+            CUdeviceptr const replica = domain.replicas_base + member * domain.stride;
+            CUmemGenericAllocationHandle physical = 0;
+            allocation.location.id = int(member);
+            CUmemAccessDesc const access = access_(member);
+            require(cuMemCreate(&physical, domain.stride, &allocation, 0), "replica allocation");
+            require(cuMulticastBindMem(domain.multicast, 0, physical, 0, domain.stride, 0), "multicast binding");
+            require(cuMemMap(replica, domain.stride, 0, physical, 0), "replica mapping");
+            require(cuMemRelease(physical), "replica handle release"); // the mapping keeps the memory
+            require(cuMemSetAccess(replica, domain.stride, &access, 1), "replica access");
+            // Blocking, so no member's first arrival can land before another's zeroing.
+            require(cudaSetDevice(int(member)), "device switch");
+            require(cuMemsetD8(replica, 0, domain.stride), "replica zeroing");
+            require(cudaDeviceSynchronize(), "replica zeroing");
+        }
+        require(cuMemAddressReserve(&domain.multicast_base, domain.stride, 0, 0, 0), "multicast reservation");
+        require(cuMemMap(domain.multicast_base, domain.stride, 0, domain.multicast, 0), "multicast mapping");
+        for (std::size_t member = 0; member != members; ++member) {
+            CUmemAccessDesc const access = access_(member);
+            require(cuMemSetAccess(domain.multicast_base, domain.stride, &access, 1), "multicast access");
+        }
+        require(cuDeviceGetAttribute(&domain.multiprocessors, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device_(0)),
+                "multiprocessor count");
+        // A kernel's first launch loads it lazily, waiting for an idle device, so load the reductions while every
+        // device is idle rather than between barriers that spin.
+        for (std::size_t member = 0; member != members; ++member) {
+            require(cudaSetDevice(int(member)), "device switch");
+            launch(&multimem_reduce_scatter_kernel, 1, block_threads_k, nk::stream_t {}, domain.multicast_payload_(),
+                   domain.payload(member), std::size_t(0), std::size_t(0));
+            launch(&multimem_all_reduce_kernel, 1, block_threads_k, nk::stream_t {}, domain.multicast_payload_(),
+                   std::size_t(0), std::size_t(0));
+            require(cudaDeviceSynchronize(), "kernel loading");
+        }
+        return domain;
+    }
+
+    /** The scalars @p member contributes and receives, in its own replica. */
+    [[nodiscard]] nk::tensor_span<f32_t, 1> payload(std::size_t member) const noexcept {
+        return {pointer_<f32_t>(replicas_base + member * stride), payload_scalars};
+    }
+
+    /** Returns on @p member 's stream once every member has entered the same round. */
+    void barrier(std::size_t member, nk::stream_t const &stream) noexcept {
+        CUdeviceptr const counters = replicas_base + member * stride + payload_scalars * sizeof(f32_t);
+        launch(&multimem_barrier_kernel, 1, 1, stream,
+               pointer_<std::uint32_t>(multicast_base + payload_scalars * sizeof(f32_t)),
+               pointer_<std::uint32_t>(counters), pointer_<std::uint32_t>(counters + sizeof(std::uint32_t)),
+               static_cast<std::uint32_t>(members));
+    }
+
+    /** In place: @p member 's slice of @p shard_scalars , a multiple of four, at @c member·shard_scalars of its
+     *  payload becomes the sum of every payload's same slice. */
+    void reduce_scatter(std::size_t member, std::size_t shard_scalars, nk::stream_t const &stream) noexcept {
+        std::size_t const begin = member * shard_scalars, end = begin + shard_scalars;
+        barrier(member, stream);
+        launch(&multimem_reduce_scatter_kernel, blocks_(shard_scalars), block_threads_k, stream, multicast_payload_(),
+               payload(member), begin, end);
+        barrier(member, stream);
+    }
+
+    /** In place: the first @p scalars , a multiple of four, of every payload become their sum, each member
+     *  reducing and broadcasting its own share. */
+    void all_reduce(std::size_t member, std::size_t scalars, nk::stream_t const &stream) noexcept {
+        std::size_t const vectors = scalars / 4, share = (vectors + members - 1) / members;
+        std::size_t const begin = std::min(member * share, vectors) * 4,
+                          end = std::min(member * share + share, vectors) * 4;
+        barrier(member, stream);
+        if (begin != end)
+            launch(&multimem_all_reduce_kernel, blocks_(end - begin), block_threads_k, stream, multicast_payload_(),
+                   begin, end);
+        barrier(member, stream);
+    }
+
+  private:
+    template <typename value_type_>
+    [[nodiscard]] static value_type_ *pointer_(CUdeviceptr address) noexcept {
+        return reinterpret_cast<value_type_ *>(address);
+    }
+    [[nodiscard]] nk::tensor_span<f32_t, 1> multicast_payload_() const noexcept {
+        return {pointer_<f32_t>(multicast_base), payload_scalars};
+    }
+    [[nodiscard]] std::uint32_t blocks_(std::size_t scalars) const noexcept {
+        std::size_t const wanted = (scalars / 4 + block_threads_k - 1) / block_threads_k;
+        return static_cast<std::uint32_t>(std::clamp<std::size_t>(wanted, 1, std::size_t(multiprocessors)));
+    }
+    [[nodiscard]] static CUdevice device_(std::size_t ordinal) noexcept {
+        CUdevice device = 0;
+        require(cuDeviceGet(&device, int(ordinal)), "device handle");
+        return device;
+    }
+    [[nodiscard]] static CUmemAccessDesc access_(std::size_t ordinal) noexcept {
+        CUmemAccessDesc access {};
+        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id = int(ordinal);
+        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        return access;
+    }
+};
+
+/** The block-wide sum, every thread receiving it, in a fixed tree order. */
+[[nodiscard]] __device__ inline f32_t block_sum(f32_t value) noexcept {
+    __shared__ f32_t partials[block_threads_k / 32];
+    for (std::uint32_t offset = 16; offset != 0; offset /= 2) value += __shfl_xor_sync(0xFFFFFFFFu, value, offset);
+    __syncthreads();
+    if (threadIdx.x % 32 == 0) partials[threadIdx.x / 32] = value;
+    __syncthreads();
+    value = threadIdx.x % 32 < blockDim.x / 32 ? partials[threadIdx.x % 32] : 0.0f;
+    for (std::uint32_t offset = 16; offset != 0; offset /= 2) value += __shfl_xor_sync(0xFFFFFFFFu, value, offset);
+    return value;
+}
+
+static __global__ void transpose_kernel(nk::tensor_view<bf16_t, 2> source, nk::tensor_span<bf16_t, 2> destination) {
+    __shared__ bf16_t tile[32][33];
+    std::size_t const column_base = blockIdx.x * 32, row_base = blockIdx.y * 32;
+    for (std::uint32_t step = threadIdx.y; step < 32; step += blockDim.y)
+        if (row_base + step < source.extent(0) && column_base + threadIdx.x < source.extent(1))
+            tile[step][threadIdx.x] = source[row_base + step, column_base + threadIdx.x];
+    __syncthreads();
+    for (std::uint32_t step = threadIdx.y; step < 32; step += blockDim.y)
+        if (column_base + step < destination.extent(0) && row_base + threadIdx.x < destination.extent(1))
+            destination[column_base + step, row_base + threadIdx.x] = tile[threadIdx.x][step];
+}
+
+static __global__ void prefix_norms_kernel(nk::tensor_view<bf16_t, 2> vertices, nk::tensor_span<f32_t, 2> norms,
+                                           matryoshka_t ladder) {
+    std::size_t const row = blockIdx.x;
+    f32_t running = 0.0f;
+    for (std::uint32_t band = 0; band != ladder.count; ++band) {
+        f32_t partial = 0.0f;
+        for (std::uint32_t channel = ladder.begin(band) + threadIdx.x; channel < ladder.ends[band];
+             channel += blockDim.x) {
+            f32_t const value = __bfloat162float(vertices[row, channel]);
+            partial += value * value;
+        }
+        running += block_sum(partial);
+        if (threadIdx.x == 0) norms[band, row] = sqrtf(running);
+    }
+}
+
+/** One row of one subgraph tile: nested raw dots from the band products, every cell's sigmoid BCE, both
+ *  directions' raw-dot gradients suffix-summed into BF16, and the row's summands added in subgraph order. */
+static __global__ void tile_kernel(nk::tensor_view<f32_t, 3> band_products, nk::tensor_view<f32_t, 2> row_norms,
+                                   nk::tensor_view<f32_t, 2> column_norms, nk::tensor_span<bf16_t, 3> gradient,
+                                   nk::tensor_span<f32_t, 2> scalars, nk::tensor_span<f32_t, 2> self_coefficients,
+                                   matryoshka_t ladder, std::size_t row_base, std::size_t column_base, f32_t beta,
+                                   f32_t bias, f32_t weight) {
+    std::size_t const row = blockIdx.x, columns = band_products.extent(2);
+    f32_t loss = 0.0f, bias_grad = 0.0f, log_beta_grad = 0.0f, coefficient[8] = {};
+    for (std::size_t column = threadIdx.x; column < columns; column += blockDim.x) {
+        bool const own_copy = row_base + row == column_base + column;
+        f32_t const target = own_copy ? 1.0f : -1.0f;
+        f32_t raw = 0.0f, raw_grad[8] = {};
+        for (std::uint32_t band = 0; band != ladder.count; ++band) {
+            raw += band_products[band, row, column];
+            f32_t const denominator = row_norms[band, row] * column_norms[band, column];
+            f32_t const logit = beta * (denominator > cosine_floor_k ? raw / denominator : 0.0f);
+            f32_t const signed_logit = target * (logit + bias);
+            f32_t const cell_grad = weight * target * (1.0f / (1.0f + expf(-signed_logit)) - 1.0f);
+            loss += weight * (fmaxf(-signed_logit, 0.0f) + log1pf(expf(-fabsf(signed_logit))));
+            bias_grad += cell_grad;
+            log_beta_grad += cell_grad * logit;
+            // The mirror cell (j, i) moves v_i the same way; a vertex's cosine with its own copy is constant.
+            raw_grad[band] = own_copy ? 0.0f : 2.0f * beta * cell_grad / fmaxf(denominator, cosine_floor_k);
+            coefficient[band] += raw_grad[band] * raw;
+        }
+        f32_t suffix = 0.0f;
+        for (std::uint32_t band = ladder.count; band-- != 0;)
+            suffix += raw_grad[band], gradient[band, row, column] = __float2bfloat16(suffix);
+    }
+    loss = block_sum(loss), bias_grad = block_sum(bias_grad), log_beta_grad = block_sum(log_beta_grad);
+    for (std::uint32_t band = 0; band != ladder.count; ++band) {
+        f32_t const total = block_sum(coefficient[band]);
+        if (threadIdx.x == 0) self_coefficients[band, row] += total;
+    }
+    if (threadIdx.x == 0) scalars[0, row] += loss, scalars[1, row] += bias_grad, scalars[2, row] += log_beta_grad;
+}
+
+static __global__ void add_kernel(nk::tensor_view<f32_t, 2> addend, nk::tensor_span<f32_t, 2> accumulator) {
+    std::size_t const columns = accumulator.extent(1), total = accumulator.extent(0) * columns;
+    for (std::size_t cell = blockIdx.x * std::size_t {blockDim.x} + threadIdx.x; cell < total;
+         cell += std::size_t {gridDim.x} * blockDim.x)
+        accumulator[cell / columns, cell % columns] += addend[cell / columns, cell % columns];
+}
+
+/** The cosine's self term folded into the forces, then the BF16 gradient. */
+static __global__ void finalize_kernel(nk::tensor_view<bf16_t, 2> vertices, nk::tensor_view<f32_t, 2> norms,
+                                       nk::tensor_view<f32_t, 2> self_coefficients, nk::tensor_view<f32_t, 2> forces,
+                                       nk::tensor_span<bf16_t, 2> gradient, matryoshka_t ladder) {
+    std::size_t const row = blockIdx.x;
+    for (std::uint32_t channel = threadIdx.x; channel < vertices.extent(1); channel += blockDim.x) {
+        f32_t fold = 0.0f;
+        for (std::uint32_t band = 0; band != ladder.count; ++band)
+            if (channel < ladder.ends[band])
+                fold += self_coefficients[band, row] / fmaxf(norms[band, row] * norms[band, row], cosine_floor_k);
+        gradient[row, channel] = __float2bfloat16(forces[row, channel] -
+                                                  fold * __bfloat162float(vertices[row, channel]));
+    }
+}
+
+static __global__ void scalars_kernel(nk::tensor_view<f32_t, 2> scalars, nk::tensor_span<f32_t, 1> out) {
+    for (std::uint32_t which = 0; which != 3; ++which) {
+        f32_t partial = 0.0f;
+        for (std::size_t row = threadIdx.x; row < scalars.extent(1); row += blockDim.x) partial += scalars[which, row];
+        f32_t const total = block_sum(partial);
+        if (threadIdx.x == 0) out[which] = total;
+    }
+}
+
+/**
+ *  @brief A rank's Matryoshka sigmoid contrastive loss, streamed one subgraph at a time and row-owned.
+ *
+ *  Every vertex is a row against all @c S·R world vertices, at every prefix of the ladder, scored by SigLIP's
+ *  sigmoid BCE with weight @c 1/(S·R): its own copy is the positive, every other vertex a negative.
+ *
+ *  - @b Streamed: each subgraph's @b [K,R,R] tile is scored, lossed and folded into the rank's forces before the
+ *    next is touched, so the scratch is one tile whatever the world.
+ *  - @b Row-owned: cell @c (i,j) and its mirror @c (j,i) share the cosine, target and weight, so the owner of @c i
+ *    differentiates both. No rank computes another's forces, and the backward exchanges nothing.
+ *
+ *  Call @ref begin , then @ref tile once per subgraph in any order, then @ref finish , which writes the
+ *  rank's loss, bias-gradient and log-β-gradient summands, which add up across ranks.
+ */
+struct streamed_loss_t {
+    matryoshka_t ladder;
+    std::size_t rows = 0, hidden = 0;
+    nk_capability_t capabilities = 0;
+    nk::tensor<f32_t, nk::allocator<f32_t>, 2> row_norms, column_norms, products, forces, scalars, self_coefficients;
+    nk::tensor<f32_t, nk::allocator<f32_t>, 3> band_products;
+    nk::tensor<bf16_t, nk::allocator<bf16_t>, 3> gradient;
+    nk::tensor<bf16_t, nk::allocator<bf16_t>, 2> transposed;
+    nk::tensor<byte_t, nk::allocator<byte_t>, 1> packed, workspace;
+
+    [[nodiscard]] static streamed_loss_t make(nk::device_t device, nk::stream_t const &stream, std::size_t rows,
+                                              std::size_t hidden, matryoshka_t ladder) noexcept {
+        streamed_loss_t loss;
+        loss.ladder = ladder, loss.rows = rows, loss.hidden = hidden;
+        loss.capabilities = take(device.capabilities_enabled(), "capability query");
+        std::size_t const k = ladder.count;
+        std::size_t pack_bytes = 1, workspace_bytes = 1; // a zero-byte tensor would read as a failed allocation
+        for (std::uint32_t band = 0; band != k; ++band) {
+            std::size_t const width = ladder.width(band);
+            pack_bytes = std::max({pack_bytes,
+                                   take(nk::dots_pack_size<nk::bf16_t>(rows, width, loss.capabilities), "pack size"),
+                                   take(nk::dots_pack_size<nk::bf16_t>(width, rows, loss.capabilities), "pack size")});
+            workspace_bytes = std::max(
+                {workspace_bytes,
+                 take(nk::dots_packed_workspace_size<nk::bf16_t>(rows, rows, width, loss.capabilities),
+                      "workspace size"),
+                 take(nk::dots_packed_workspace_size<nk::bf16_t>(rows, width, rows, loss.capabilities),
+                      "workspace size")});
+        }
+        loss.row_norms = make_tensor<f32_t, 2>(loss.capabilities, stream, {k, rows});
+        loss.column_norms = make_tensor<f32_t, 2>(loss.capabilities, stream, {k, rows});
+        loss.products = make_tensor<f32_t, 2>(loss.capabilities, stream, {rows, hidden});
+        loss.forces = make_tensor<f32_t, 2>(loss.capabilities, stream, {rows, hidden});
+        loss.scalars = make_tensor<f32_t, 2>(loss.capabilities, stream, {3, rows});
+        loss.self_coefficients = make_tensor<f32_t, 2>(loss.capabilities, stream, {k, rows});
+        loss.band_products = make_tensor<f32_t, 3>(loss.capabilities, stream, {k, rows, rows});
+        loss.gradient = make_tensor<bf16_t, 3>(loss.capabilities, stream, {k, rows, rows});
+        loss.transposed = make_tensor<bf16_t, 2>(loss.capabilities, stream, {hidden, rows});
+        loss.packed = make_tensor<byte_t, 1>(loss.capabilities, stream, {pack_bytes});
+        loss.workspace = make_tensor<byte_t, 1>(loss.capabilities, stream, {workspace_bytes});
+        return loss;
+    }
+
+    /** Device bytes the loss holds, independent of the world's size. */
+    [[nodiscard]] std::size_t bytes() const noexcept {
+        return (row_norms.numel() + column_norms.numel() + products.numel() + forces.numel() + scalars.numel() +
+                self_coefficients.numel() + band_products.numel()) *
+                   sizeof(f32_t) +
+               (gradient.numel() + transposed.numel()) * sizeof(bf16_t) + packed.numel() + workspace.numel();
+    }
+
+    void begin(nk::tensor_view<bf16_t, 2> vertices, nk::stream_t const &stream) noexcept {
+        cudaStream_t const cuda = cuda_stream(stream);
+        require(cudaMemsetAsync(forces.data(), 0, forces.numel() * sizeof(f32_t), cuda), "zeroing forces");
+        require(cudaMemsetAsync(scalars.data(), 0, scalars.numel() * sizeof(f32_t), cuda), "zeroing scalars");
+        require(cudaMemsetAsync(self_coefficients.data(), 0, self_coefficients.numel() * sizeof(f32_t), cuda),
+                "zeroing coefficients");
+        launch(&prefix_norms_kernel, rows, block_threads_k, stream, vertices, row_norms.span(), ladder);
+    }
+
+    /** Score this rank's rows against @p subgraph , whose first vertex is @p column_base on the global axis. */
+    void tile(nk::tensor_view<bf16_t, 2> vertices, nk::tensor_view<bf16_t, 2> subgraph, std::size_t row_base,
+              std::size_t column_base, f32_t beta, f32_t bias, f32_t live, nk::stream_t const &stream) noexcept {
+        launch(&prefix_norms_kernel, rows, block_threads_k, stream, subgraph, column_norms.span(), ladder);
+        dim3 const transpose_grid {static_cast<std::uint32_t>(hidden / 32), static_cast<std::uint32_t>(rows / 32)};
+        launch(&transpose_kernel, transpose_grid, dim3 {32, 8}, stream, subgraph, transposed.span());
+        for (std::uint32_t band = 0; band != ladder.count; ++band)
+            multiply_(vertices.data() + ladder.begin(band), hidden, subgraph.data() + ladder.begin(band), hidden,
+                      band_products.data() + band * rows * rows, rows, rows, rows, ladder.width(band), stream);
+        launch(&tile_kernel, rows, block_threads_k, stream, band_products.view(), row_norms.view(), column_norms.view(),
+               gradient.span(), scalars.span(), self_coefficients.span(), ladder, row_base, column_base, beta, bias,
+               1.0f / live);
+        for (std::uint32_t band = 0; band != ladder.count; ++band)
+            multiply_(gradient.data() + band * rows * rows, rows, transposed.data() + ladder.begin(band) * rows, rows,
+                      products.data() + ladder.begin(band), hidden, rows, ladder.width(band), rows, stream);
+        launch(&add_kernel, (rows * hidden + block_threads_k - 1) / block_threads_k, block_threads_k, stream,
+               products.view(), forces.span());
+    }
+
+    /** Writes the BF16 @p gradient_out and the three @p summands , a multimem payload or any device span. */
+    void finish(nk::tensor_view<bf16_t, 2> vertices, nk::tensor_span<bf16_t, 2> gradient_out,
+                nk::tensor_span<f32_t, 1> summands, nk::stream_t const &stream) noexcept {
+        launch(&finalize_kernel, rows, block_threads_k, stream, vertices, row_norms.view(), self_coefficients.view(),
+               forces.view(), gradient_out, ladder);
+        launch(&scalars_kernel, 1, block_threads_k, stream, scalars.view(), summands);
+    }
+
+  private:
+    /** @c c=a·bᵀ for @p a @b [m,depth], @p b @b [n,depth] and @p c @b [m,n], each with a row stride in scalars. */
+    void multiply_(bf16_t const *a, std::size_t a_stride, bf16_t const *b, std::size_t b_stride, f32_t *c,
+                   std::size_t c_stride, std::size_t m, std::size_t n, std::size_t depth,
+                   nk::stream_t const &stream) noexcept {
+        require(nk::dots_pack<nk::bf16_t>(reinterpret_cast<nk::bf16_t const *>(b), n, depth, b_stride * sizeof(bf16_t),
+                                          packed.data(), capabilities, stream.get()),
+                "pack");
+        require(nk::dots_packed<nk::bf16_t>(
+                    reinterpret_cast<nk::bf16_t const *>(a), packed.data(), reinterpret_cast<nk::f32_t *>(c), m, n,
+                    depth, a_stride * sizeof(bf16_t), c_stride * sizeof(f32_t),
+                    std::span<byte_t> {workspace.data(), workspace.numel()}, capabilities, stream.get()),
+                "product");
+    }
+};
+
+} // namespace ashvardanian::scalingcontrasts
