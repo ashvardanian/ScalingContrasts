@@ -1,7 +1,8 @@
 cmake_minimum_required(VERSION 3.28)
 project(scalingcontrasts LANGUAGES CXX CUDA)
 
-set(SCALINGCONTRASTS_CUDA_ARCHITECTURES "100f-real" CACHE STRING "GPU code to compile, as SASS")
+# B300 only: `tcgen05` and TMA need the architecture-specific Blackwell Ultra target.
+set(SCALINGCONTRASTS_CUDA_ARCHITECTURES "103a-real" CACHE STRING "GPU code to compile, as SASS")
 find_package(CUDAToolkit REQUIRED)
 find_path(SCALINGCONTRASTS_VERBS_INCLUDE infiniband/verbs.h REQUIRED)
 find_library(SCALINGCONTRASTS_VERBS_LIBRARY ibverbs REQUIRED)

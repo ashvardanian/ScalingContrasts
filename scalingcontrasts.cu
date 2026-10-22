@@ -80,7 +80,9 @@ static __global__ void count_wrong_sums_kernel(nk::tensor_view<f32_t, 1> payload
     if (scalar >= end) return;
     f32_t expected = 0.0f;
     for (std::size_t member = 0; member != members; ++member) expected += keyed_integer(scalar, member, members);
-    if (payload[scalar] != expected) atomicAdd(wrong, 1ull);
+    if (payload[scalar] != expected)
+        cuda::atomic_ref<unsigned long long, cuda::thread_scope_system>(*wrong).fetch_add(
+            1ull, cuda::std::memory_order_relaxed);
 }
 
 /** Counts into @p differing the scalars of @p actual whose bits differ from @p reference . */
@@ -88,7 +90,9 @@ static __global__ void count_differences_kernel(nk::tensor_view<f32_t, 1> actual
                                                 unsigned long long *differing) {
     std::size_t const scalar = blockIdx.x * std::size_t {blockDim.x} + threadIdx.x;
     if (scalar >= actual.extent(0)) return;
-    if (__float_as_uint(actual[scalar]) != __float_as_uint(reference[scalar])) atomicAdd(differing, 1ull);
+    if (__float_as_uint(actual[scalar]) != __float_as_uint(reference[scalar]))
+        cuda::atomic_ref<unsigned long long, cuda::thread_scope_system>(*differing)
+            .fetch_add(1ull, cuda::std::memory_order_relaxed);
 }
 
 [[nodiscard]] static std::uint32_t blocks_for(std::size_t scalars) noexcept {
@@ -201,7 +205,7 @@ static void step_box(std::vector<member_t> &members, multimem_domain_t &domain, 
         require(cudaSetDevice(int(rank)), "device switch");
         member.loss.begin(member.tower.view(), member.stream);
         for (std::size_t peer = 0; peer != gpus; ++peer)
-            member.loss.tile(member.tower.view(), members[peer].tower.view(), rank * settings.rows,
+            member.loss.tile(member.tower.span(), members[peer].tower.view(), rank * settings.rows,
                              peer * settings.rows, beta, bias, f32_t(gpus * settings.rows), member.stream);
         member.loss.finish(member.tower.view(), member.gradient.span(), domain.payload(rank), member.stream);
         domain.all_reduce(rank, summand_scalars_k, member.stream);
@@ -325,7 +329,7 @@ static void step_hosts(std::vector<member_t> &members, multimem_domain_t &domain
         require(cudaSetDevice(int(rank)), "device switch");
         member.loss.begin(member.tower.view(), member.stream);
         for (std::size_t peer = 0; peer != gpus; ++peer)
-            member.loss.tile(member.tower.view(), members[peer].tower.view(),
+            member.loss.tile(member.tower.span(), members[peer].tower.view(),
                              (settings.host * gpus + rank) * settings.rows,
                              (settings.host * gpus + peer) * settings.rows, beta, bias, f32_t(live), member.stream);
     }
@@ -341,7 +345,7 @@ static void step_hosts(std::vector<member_t> &members, multimem_domain_t &domain
         require(cudaSetDevice(int(rank)), "device switch");
         for (std::size_t remote = 0; remote + 1 != settings.hosts; ++remote)
             for (std::size_t peer = 0; peer != gpus; ++peer)
-                member.loss.tile(member.tower.view(), members[peer].landings[remote, parity, nk::slice],
+                member.loss.tile(member.tower.span(), members[peer].landings[remote, parity, nk::slice],
                                  (settings.host * gpus + rank) * settings.rows,
                                  (remote_host(remote, settings.host) * gpus + peer) * settings.rows, beta, bias,
                                  f32_t(live), member.stream);
@@ -438,7 +442,7 @@ int main(int argc, char **argv) {
         auto const step = [&] {
             member.loss.begin(member.tower.view(), member.stream);
             for (std::size_t subgraph = 0; subgraph != settings.world; ++subgraph)
-                member.loss.tile(member.tower.view(), member.tower.view(), 0, subgraph * settings.rows, beta, bias,
+                member.loss.tile(member.tower.span(), member.tower.view(), 0, subgraph * settings.rows, beta, bias,
                                  f32_t(settings.world * settings.rows), member.stream);
             member.loss.finish(member.tower.view(), member.gradient.span(), summands.span(), member.stream);
         };
