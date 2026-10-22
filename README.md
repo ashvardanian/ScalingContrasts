@@ -125,7 +125,7 @@ The binary prints one CSV row per measurement:
 ```sh
 build_release/scalingcontrasts oracle --rows 128   # every local GPU against a Float64 evaluation
 build_release/scalingcontrasts box --rows 4096    # every local GPU, peers read in place
-build_release/scalingcontrasts simulate --rows 4096 --world 72
+build_release/scalingcontrasts simulate --rows 4096 --gpus 72
 build_release/scalingcontrasts collectives --max-mib 128
 ```
 
