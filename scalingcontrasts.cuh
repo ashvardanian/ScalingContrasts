@@ -4,26 +4,32 @@
  *  @date October 22, 2026
  *  @brief Direct NVLink scale-up primitives for training, and a contrastive loss built on them.
  *
- *  A contrastive loss scores every vertex of a batch against every other one, so its batch, and with it the
- *  number of negatives each pair learns from, is bounded by how cheaply GPUs can see each other's vertices.
- *  This header holds the pieces that keep that cheap: a streamed, row-owned sigmoid loss whose memory does not
- *  grow with the world and whose backward exchanges nothing.
+ *  A contrastive loss scores every vertex of a batch against every other one, so its batch, and
+ *  with it the number of negatives each pair learns from, is bounded by how cheaply GPUs can see
+ *  each other's vertices. This header holds the pieces that keep that cheap: a streamed, row-owned
+ *  sigmoid loss whose memory does not grow with the world and whose backward exchanges nothing.
  */
 #pragma once
 
+#include <cerrno>  // `errno`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`
 #include <cstdio>  // `std::fprintf`
 #include <cstdlib> // `std::exit`
+#include <cstring> // `std::strerror`, `std::strcmp`
+
+#include <arpa/inet.h> // `htonl`
+#include <unistd.h>    // `close`
 
 #include <algorithm> // `std::max`, `std::clamp`
 #include <span>      // `std::span`
 #include <tuple>     // `std::tuple`, `std::apply`
 #include <utility>   // `std::exchange`
 
-#include <cuda.h>         // `cuMulticastCreate`, `cuMulticastBindMem`, `cuMemMap`, `cuMemSetAccess`
-#include <cuda_bf16.h>    // `__nv_bfloat16`
-#include <cuda_runtime.h> // `cudaStream_t`, `cudaMemsetAsync`
+#include <cuda.h>             // `cuMulticastCreate`, `cuMulticastBindMem`, `cuMemMap`, `cuMemSetAccess`
+#include <cuda_bf16.h>        // `__nv_bfloat16`
+#include <cuda_runtime.h>     // `cudaStream_t`, `cudaMemsetAsync`
+#include <infiniband/verbs.h> // `ibv_reg_dmabuf_mr`, `ibv_post_send`, `ibv_poll_cq`
 
 #include <numkong/numkong.hpp> // `nk::tensor`, `nk::allocator`, `nk::dots_pack`, `nk::dots_packed`
 
@@ -80,8 +86,8 @@ template <typename value_type_>
     return std::move(made.value);
 }
 
-/** A tensor of @p extents from NumKong's @p initialize policy bound to @p stream: allocated on the stream's
- *  device and freed in its order, as device, pinned or unified memory. */
+/** A tensor of @p extents from NumKong's @p initialize policy bound to @p stream: allocated on the
+ *  stream's device and freed in its order, as device, pinned or unified memory. */
 template <typename value_type_, std::size_t rank_>
 [[nodiscard]] nk::tensor<value_type_, nk::allocator<value_type_>, rank_> make_tensor(
     nk_capability_t capabilities, nk::stream_t const &stream, std::initializer_list<std::size_t> extents,
@@ -92,7 +98,8 @@ template <typename value_type_, std::size_t rank_>
         "allocation");
 }
 
-/** The Matryoshka ladder, ascending prefix widths; band @c b covers the channels @b [begin(b),ends[b]). */
+/** The Matryoshka ladder, ascending prefix widths; band @c b covers the channels
+ *  @b [begin(b),ends[b]). */
 struct matryoshka_t {
     std::uint32_t count = 0;
     std::uint32_t ends[8] = {};
@@ -113,8 +120,8 @@ struct matryoshka_t {
     }
 };
 
-/** Adds this member's arrival to every replica's flag, waits on its own flag for the round's last arrival, and
- *  advances its own round, so the counters never reset. */
+/** Adds this member's arrival to every replica's flag, waits on its own flag for the round's last
+ *  arrival, and advances its own round, so the counters never reset. */
 static __global__ void multimem_barrier_kernel(std::uint32_t *multicast_flag, std::uint32_t *own_flag,
                                                std::uint32_t *own_round, std::uint32_t members) {
     std::uint32_t const target = *own_round + members;
@@ -141,8 +148,8 @@ static __global__ void multimem_reduce_scatter_kernel(nk::tensor_view<f32_t, 1> 
     }
 }
 
-/** @c payload[i]=Σ(members)payload[i] over @b [begin,end) on every replica: one switch-reduced load and one
- *  multicast store per four scalars. */
+/** @c payload[i]=Σ(members)payload[i] over @b [begin,end) on every replica: one switch-reduced load
+ *  and one multicast store per four scalars. */
 static __global__ void multimem_all_reduce_kernel(nk::tensor_span<f32_t, 1> multicast, std::size_t begin,
                                                   std::size_t end) {
     for (std::size_t scalar = begin + 4 * (blockIdx.x * std::size_t {blockDim.x} + threadIdx.x); scalar < end;
@@ -167,12 +174,13 @@ inline void require(CUresult result, char const *what) noexcept {
 }
 
 /**
- *  @brief One host's GPUs as an NVLink multicast domain: a replica per GPU, all bound into one multicast object
- *      that any of them addresses to reduce in the switch or to store into every replica at once.
+ *  @brief One host's GPUs as an NVLink multicast domain: a replica per GPU, all bound into one
+ *      multicast object that any of them addresses to reduce in the switch or to store into every
+ *      replica at once.
  *
- *  A replica holds @ref payload_scalars scalars, then its arrival flag and its barrier round. Only its own GPU
- *  reads the round, so barriers advance with no host writes. Every call enqueues on @p member 's stream, with
- *  that member's device current.
+ *  A replica holds @ref payload_scalars scalars, then its arrival flag and its barrier round. Only
+ *  its own GPU reads the round, so barriers advance with no host writes. Every call enqueues on
+ *  @p member 's stream, with that member's device current.
  */
 struct multimem_domain_t {
     std::size_t members = 0, payload_scalars = 0, stride = 0;
@@ -198,7 +206,8 @@ struct multimem_domain_t {
         require(cuMemRelease(multicast), "multicast release");
     }
 
-    /** Binds a zeroed replica of @p payload_scalars, a multiple of four, on each of the first @p members GPUs. */
+    /** Binds a zeroed replica of @p payload_scalars, a multiple of four, on each of the first
+     *  @p members GPUs. */
     [[nodiscard]] static multimem_domain_t make(std::size_t members, std::size_t payload_scalars) noexcept {
         multimem_domain_t domain;
         domain.members = members, domain.payload_scalars = payload_scalars;
@@ -209,7 +218,8 @@ struct multimem_domain_t {
         CUmulticastObjectProp properties {};
         properties.numDevices = static_cast<unsigned>(members);
         properties.handleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-        properties.size = (payload_scalars + 4) * sizeof(f32_t); // the payload, then the flag and the round
+        // the payload, then the flag and the round
+        properties.size = (payload_scalars + 4) * sizeof(f32_t);
         std::size_t allocation_granularity = 0, multicast_granularity = 0;
         require(cuMemGetAllocationGranularity(&allocation_granularity, &allocation, CU_MEM_ALLOC_GRANULARITY_MINIMUM),
                 "allocation granularity");
@@ -230,7 +240,8 @@ struct multimem_domain_t {
             require(cuMemCreate(&physical, domain.stride, &allocation, 0), "replica allocation");
             require(cuMulticastBindMem(domain.multicast, 0, physical, 0, domain.stride, 0), "multicast binding");
             require(cuMemMap(replica, domain.stride, 0, physical, 0), "replica mapping");
-            require(cuMemRelease(physical), "replica handle release"); // the mapping keeps the memory
+            // the mapping keeps the memory
+            require(cuMemRelease(physical), "replica handle release");
             require(cuMemSetAccess(replica, domain.stride, &access, 1), "replica access");
             // Blocking, so no member's first arrival can land before another's zeroing.
             require(cudaSetDevice(int(member)), "device switch");
@@ -245,8 +256,8 @@ struct multimem_domain_t {
         }
         require(cuDeviceGetAttribute(&domain.multiprocessors, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device_(0)),
                 "multiprocessor count");
-        // A kernel's first launch loads it lazily, waiting for an idle device, so load the reductions while every
-        // device is idle rather than between barriers that spin.
+        // A kernel's first launch loads it lazily, waiting for an idle device, so load the
+        // reductions while every device is idle rather than between barriers that spin.
         for (std::size_t member = 0; member != members; ++member) {
             require(cudaSetDevice(int(member)), "device switch");
             launch(&multimem_reduce_scatter_kernel, 1, block_threads_k, nk::stream_t {}, domain.multicast_payload_(),
@@ -272,8 +283,8 @@ struct multimem_domain_t {
                static_cast<std::uint32_t>(members));
     }
 
-    /** In place: @p member 's slice of @p shard_scalars , a multiple of four, at @c member·shard_scalars of its
-     *  payload becomes the sum of every payload's same slice. */
+    /** In place: @p member 's slice of @p shard_scalars , a multiple of four, at
+     *  @c member·shard_scalars of its payload becomes the sum of every payload's same slice. */
     void reduce_scatter(std::size_t member, std::size_t shard_scalars, nk::stream_t const &stream) noexcept {
         std::size_t const begin = member * shard_scalars, end = begin + shard_scalars;
         barrier(member, stream);
@@ -282,8 +293,8 @@ struct multimem_domain_t {
         barrier(member, stream);
     }
 
-    /** In place: the first @p scalars , a multiple of four, of every payload become their sum, each member
-     *  reducing and broadcasting its own share. */
+    /** In place: the first @p scalars , a multiple of four, of every payload become their sum, each
+     *  member reducing and broadcasting its own share. */
     void all_reduce(std::size_t member, std::size_t scalars, nk::stream_t const &stream) noexcept {
         std::size_t const vectors = scalars / 4, share = (vectors + members - 1) / members;
         std::size_t const begin = std::min(member * share, vectors) * 4,
@@ -318,6 +329,237 @@ struct multimem_domain_t {
         access.location.id = int(ordinal);
         access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
         return access;
+    }
+};
+
+/** Ends the process when a verbs call returned @p result , an @c errno value or zero. */
+inline void require(int result, char const *what) noexcept {
+    if (result == 0) return;
+    std::fprintf(stderr, "%s failed: %s\n", what, std::strerror(result));
+    std::exit(1);
+}
+
+/** What a rail's counterpart needs to reach it: its queue pair, its address, and the landings it
+ *  may write. */
+struct rdma_endpoint_t {
+    ibv_gid gid {};
+    std::uint64_t landing_address = 0, scalars_address = 0;
+    std::uint32_t queue_pair = 0, packet_sequence = 0, landing_key = 0, scalars_key = 0;
+};
+
+/**
+ *  @brief One RoCE rail between a GPU and its counterpart on another host: an RC queue pair on the
+ *      GPU's own NIC, writing GPU memory straight into GPU memory, registered as dma-buf.
+ *
+ *  - @b Towers: the GPU's tower lands in the counterpart's @c landing[parity], double-buffered by
+ *    step parity, and the counterpart's other GPUs read it in place over NVLink.
+ *  - @b Scalars: a row of host-pinned @c scalars, at the sender's host index, lands in the same row
+ *    on the other side, so every host adds the rows in one order.
+ *
+ *  Every write carries an immediate, so its landing completes one receive that @ref await_landed
+ *  reaps.
+ */
+struct rdma_rail_t {
+    ibv_context *context = nullptr;
+    ibv_pd *protection = nullptr;
+    ibv_cq *completions = nullptr;
+    ibv_qp *queue_pair = nullptr;
+    ibv_mr *tower = nullptr, *landing = nullptr, *scalars = nullptr;
+    rdma_endpoint_t local, remote;
+    ibv_mtu mtu = IBV_MTU_1024;
+    int gid_index = 0;
+    std::uint64_t tower_address = 0;
+    std::size_t tower_bytes = 0, scalars_row_bytes = 0, landed = 0;
+
+    rdma_rail_t() noexcept = default;
+    rdma_rail_t(rdma_rail_t const &) = delete;
+    rdma_rail_t(rdma_rail_t &&other) noexcept
+        : context(std::exchange(other.context, nullptr)), protection(std::exchange(other.protection, nullptr)),
+          completions(std::exchange(other.completions, nullptr)), queue_pair(std::exchange(other.queue_pair, nullptr)),
+          tower(std::exchange(other.tower, nullptr)), landing(std::exchange(other.landing, nullptr)),
+          scalars(std::exchange(other.scalars, nullptr)), local(other.local), remote(other.remote), mtu(other.mtu),
+          gid_index(other.gid_index), tower_address(other.tower_address), tower_bytes(other.tower_bytes),
+          scalars_row_bytes(other.scalars_row_bytes), landed(other.landed) {}
+
+    ~rdma_rail_t() noexcept {
+        if (!context) return;
+        require(ibv_destroy_qp(queue_pair), "queue pair release");
+        for (ibv_mr *registration : {tower, landing, scalars}) require(ibv_dereg_mr(registration), "deregistration");
+        require(ibv_destroy_cq(completions), "completion queue release");
+        require(ibv_dealloc_pd(protection), "protection domain release");
+        require(ibv_close_device(context), "device release");
+    }
+
+    /** Opens @p nic , registers @p tower , @p landing @b [2,rows,hidden] and the host-pinned
+     *  @p scalars @b [hosts,4], and readies a queue pair whose @ref local endpoint the
+     *  counterpart must receive. */
+    [[nodiscard]] static rdma_rail_t make(char const *nic, nk::tensor_view<bf16_t, 2> tower,
+                                          nk::tensor_span<bf16_t, 3> landing, nk::tensor_span<f32_t, 2> scalars,
+                                          std::uint32_t packet_sequence) noexcept {
+        constexpr std::uint8_t port = 1;
+        rdma_rail_t rail;
+        int devices = 0;
+        ibv_device **list = ibv_get_device_list(&devices);
+        for (int index = 0; index != devices && !rail.context; ++index)
+            if (!std::strcmp(ibv_get_device_name(list[index]), nic)) rail.context = ibv_open_device(list[index]);
+        ibv_free_device_list(list);
+        require(rail.context ? 0 : ENODEV, nic);
+        ibv_port_attr port_attributes {};
+        require(ibv_query_port(rail.context, port, &port_attributes), "port query");
+        rail.mtu = port_attributes.active_mtu;
+        rail.local.gid = roce_v2_gid_(rail.context, port, port_attributes.gid_tbl_len, rail.gid_index);
+        require((rail.protection = ibv_alloc_pd(rail.context)) ? 0 : errno, "protection domain");
+        require((rail.completions = ibv_create_cq(rail.context, 64, nullptr, nullptr, 0)) ? 0 : errno,
+                "completion queue");
+        ibv_qp_init_attr initial {};
+        initial.send_cq = initial.recv_cq = rail.completions;
+        initial.qp_type = IBV_QPT_RC;
+        initial.cap.max_send_wr = initial.cap.max_recv_wr = 16;
+        initial.cap.max_send_sge = 1;
+        require((rail.queue_pair = ibv_create_qp(rail.protection, &initial)) ? 0 : errno, "queue pair");
+
+        rail.tower_address = reinterpret_cast<std::uint64_t>(tower.data());
+        rail.tower_bytes = tower.numel() * sizeof(bf16_t);
+        rail.scalars_row_bytes = scalars.extent(1) * sizeof(f32_t);
+        rail.tower = register_device_(rail.protection, tower.data(), rail.tower_bytes, IBV_ACCESS_LOCAL_WRITE);
+        rail.landing = register_device_(rail.protection, landing.data(), landing.numel() * sizeof(bf16_t),
+                                        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        require((rail.scalars = ibv_reg_mr(rail.protection, scalars.data(), scalars.numel() * sizeof(f32_t),
+                                           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE))
+                    ? 0
+                    : errno,
+                "scalars registration");
+        rail.local.queue_pair = rail.queue_pair->qp_num;
+        rail.local.packet_sequence = packet_sequence & 0xFFFFFFu;
+        rail.local.landing_address = reinterpret_cast<std::uint64_t>(landing.data());
+        rail.local.landing_key = rail.landing->rkey;
+        rail.local.scalars_address = reinterpret_cast<std::uint64_t>(scalars.data());
+        rail.local.scalars_key = rail.scalars->rkey;
+
+        ibv_qp_attr attributes {};
+        attributes.qp_state = IBV_QPS_INIT;
+        attributes.port_num = port;
+        attributes.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
+        require(ibv_modify_qp(rail.queue_pair, &attributes,
+                              IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS),
+                "queue pair initialization");
+        for (std::uint32_t receive = 0; receive != initial.cap.max_recv_wr; ++receive) rail.post_receive_();
+        return rail;
+    }
+
+    /** Joins the queue pair to the @p counterpart endpoint, after which both sides may write. */
+    void connect(rdma_endpoint_t const &counterpart) noexcept {
+        constexpr std::uint8_t port = 1;
+        remote = counterpart;
+        ibv_qp_attr attributes {};
+        attributes.qp_state = IBV_QPS_RTR;
+        attributes.path_mtu = mtu;
+        attributes.dest_qp_num = remote.queue_pair;
+        attributes.rq_psn = remote.packet_sequence;
+        attributes.max_dest_rd_atomic = 1;
+        attributes.min_rnr_timer = 12;
+        attributes.ah_attr.is_global = 1;
+        attributes.ah_attr.grh.dgid = remote.gid;
+        attributes.ah_attr.grh.sgid_index = std::uint8_t(gid_index);
+        attributes.ah_attr.grh.hop_limit = 64;
+        attributes.ah_attr.port_num = port;
+        require(ibv_modify_qp(queue_pair, &attributes,
+                              IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+                                  IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER),
+                "queue pair readiness to receive");
+        attributes = {};
+        attributes.qp_state = IBV_QPS_RTS;
+        attributes.timeout = 14;
+        attributes.retry_cnt = 7;
+        attributes.rnr_retry = 7;
+        attributes.sq_psn = local.packet_sequence;
+        attributes.max_rd_atomic = 1;
+        require(ibv_modify_qp(queue_pair, &attributes,
+                              IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
+                                  IBV_QP_MAX_QP_RD_ATOMIC),
+                "queue pair readiness to send");
+    }
+
+    /** Writes the whole tower into the counterpart's @c landing[parity]. */
+    void post_tower(std::size_t parity) noexcept {
+        post_write_(tower_address, tower_bytes, tower->lkey, remote.landing_address + parity * tower_bytes,
+                    remote.landing_key);
+    }
+
+    /** Writes @c scalars[host] into the counterpart's @c scalars[host]. */
+    void post_scalars(std::size_t host) noexcept {
+        std::uint64_t const offset = host * scalars_row_bytes;
+        post_write_(reinterpret_cast<std::uint64_t>(scalars->addr) + offset, scalars_row_bytes, scalars->lkey,
+                    remote.scalars_address + offset, remote.scalars_key);
+    }
+
+    /** Returns once the counterpart's next write has landed here, in the order the counterpart
+     *  posted them. */
+    void await_landed() noexcept {
+        while (!landed) {
+            ibv_wc entries[16];
+            int const polled = ibv_poll_cq(completions, 16, entries);
+            require(polled < 0 ? -polled : 0, "completion polling");
+            for (int index = 0; index != polled; ++index) {
+                require(entries[index].status == IBV_WC_SUCCESS ? 0 : EIO, ibv_wc_status_str(entries[index].status));
+                if (entries[index].opcode == IBV_WC_RECV_RDMA_WITH_IMM) ++landed, post_receive_();
+            }
+        }
+        --landed;
+    }
+
+  private:
+
+    /** The port's routable RoCE GID with an IPv4-mapped address, the kind routed rails use. */
+    [[nodiscard]] static ibv_gid roce_v2_gid_(ibv_context *context, std::uint8_t port, int entries,
+                                              int &found) noexcept {
+        for (int index = 0; index != entries; ++index) {
+            ibv_gid_entry entry {};
+            if (ibv_query_gid_ex(context, port, std::uint32_t(index), &entry, 0) != 0) continue;
+            std::uint8_t const *raw = entry.gid.raw;
+            bool const ipv4 = std::all_of(raw, raw + 10, [](std::uint8_t byte) { return byte == 0; }) &&
+                              raw[10] == 0xFF && raw[11] == 0xFF;
+            if (entry.gid_type != IBV_GID_TYPE_ROCE_V2 || !ipv4) continue;
+            found = index;
+            return entry.gid;
+        }
+        require(ENOENT, "RoCE v2 IPv4 GID lookup");
+        return {};
+    }
+
+    /** Registers device memory as a dma-buf, so no peer-memory kernel module is needed. */
+    [[nodiscard]] static ibv_mr *register_device_(ibv_pd *protection, void const *pointer, std::size_t bytes,
+                                                  int access) noexcept {
+        CUdeviceptr base = 0;
+        std::size_t allocation = 0;
+        require(cuMemGetAddressRange(&base, &allocation, reinterpret_cast<CUdeviceptr>(pointer)), "allocation range");
+        int descriptor = -1;
+        require(cuMemGetHandleForAddressRange(&descriptor, base, allocation, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0),
+                "dma-buf export");
+        ibv_mr *registration = ibv_reg_dmabuf_mr(protection, reinterpret_cast<CUdeviceptr>(pointer) - base, bytes,
+                                                 reinterpret_cast<std::uint64_t>(pointer), descriptor, access);
+        int const failure = registration ? 0 : errno;
+        // the registration holds the buffer
+        require(close(descriptor) == 0 ? 0 : errno, "dma-buf release");
+        require(failure, "dma-buf registration");
+        return registration;
+    }
+
+    void post_receive_() noexcept {
+        ibv_recv_wr request {}, *refused = nullptr;
+        require(ibv_post_recv(queue_pair, &request, &refused), "receive posting");
+    }
+
+    void post_write_(std::uint64_t source, std::size_t bytes, std::uint32_t source_key, std::uint64_t target,
+                     std::uint32_t target_key) noexcept {
+        ibv_sge piece {source, std::uint32_t(bytes), source_key};
+        ibv_send_wr request {}, *refused = nullptr;
+        request.sg_list = &piece, request.num_sge = 1;
+        request.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+        request.send_flags = IBV_SEND_SIGNALED;
+        request.imm_data = htonl(std::uint32_t(bytes));
+        request.wr.rdma.remote_addr = target, request.wr.rdma.rkey = target_key;
+        require(ibv_post_send(queue_pair, &request, &refused), "write posting");
     }
 };
 
@@ -361,8 +603,9 @@ static __global__ void prefix_norms_kernel(nk::tensor_view<bf16_t, 2> vertices, 
     }
 }
 
-/** One row of one subgraph tile: nested raw dots from the band products, every cell's sigmoid BCE, both
- *  directions' raw-dot gradients suffix-summed into BF16, and the row's summands added in subgraph order. */
+/** One row of one subgraph tile: nested raw dots from the band products, every cell's sigmoid BCE,
+ *  both directions' raw-dot gradients suffix-summed into BF16, and the row's summands added in
+ *  subgraph order. */
 static __global__ void tile_kernel(nk::tensor_view<f32_t, 3> band_products, nk::tensor_view<f32_t, 2> row_norms,
                                    nk::tensor_view<f32_t, 2> column_norms, nk::tensor_span<bf16_t, 3> gradient,
                                    nk::tensor_span<f32_t, 2> scalars, nk::tensor_span<f32_t, 2> self_coefficients,
@@ -383,7 +626,8 @@ static __global__ void tile_kernel(nk::tensor_view<f32_t, 3> band_products, nk::
             loss += weight * (fmaxf(-signed_logit, 0.0f) + log1pf(expf(-fabsf(signed_logit))));
             bias_grad += cell_grad;
             log_beta_grad += cell_grad * logit;
-            // The mirror cell (j, i) moves v_i the same way; a vertex's cosine with its own copy is constant.
+            // The mirror cell (j, i) moves v_i the same way; a vertex's cosine with its own copy is
+            // constant.
             raw_grad[band] = own_copy ? 0.0f : 2.0f * beta * cell_grad / fmaxf(denominator, cosine_floor_k);
             coefficient[band] += raw_grad[band] * raw;
         }
@@ -431,18 +675,21 @@ static __global__ void scalars_kernel(nk::tensor_view<f32_t, 2> scalars, nk::ten
 }
 
 /**
- *  @brief A rank's Matryoshka sigmoid contrastive loss, streamed one subgraph at a time and row-owned.
+ *  @brief A rank's Matryoshka sigmoid contrastive loss, streamed one subgraph at a time and
+ *      row-owned.
  *
- *  Every vertex is a row against all @c S·R world vertices, at every prefix of the ladder, scored by SigLIP's
- *  sigmoid BCE with weight @c 1/(S·R): its own copy is the positive, every other vertex a negative.
+ *  Every vertex is a row against all @c S·R world vertices, at every prefix of the ladder, scored
+ *  by SigLIP's sigmoid BCE with weight @c 1/(S·R): its own copy is the positive, every other vertex
+ *  a negative.
  *
- *  - @b Streamed: each subgraph's @b [K,R,R] tile is scored, lossed and folded into the rank's forces before the
- *    next is touched, so the scratch is one tile whatever the world.
- *  - @b Row-owned: cell @c (i,j) and its mirror @c (j,i) share the cosine, target and weight, so the owner of @c i
- *    differentiates both. No rank computes another's forces, and the backward exchanges nothing.
+ *  - @b Streamed: each subgraph's @b [K,R,R] tile is scored, lossed and folded into the rank's
+ *    forces before the next is touched, so the scratch is one tile whatever the world.
+ *  - @b Row-owned: cell @c (i,j) and its mirror @c (j,i) share the cosine, target and weight, so
+ *    the owner of @c i differentiates both. No rank computes another's forces, and the backward
+ *    exchanges nothing.
  *
- *  Call @ref begin , then @ref tile once per subgraph in any order, then @ref finish , which writes the
- *  rank's loss, bias-gradient and log-β-gradient summands, which add up across ranks.
+ *  Call @ref begin , then @ref tile once per subgraph in any order, then @ref finish , which writes
+ *  the rank's loss, bias-gradient and log-β-gradient summands, which add up across ranks.
  */
 struct streamed_loss_t {
     matryoshka_t ladder;
@@ -460,7 +707,8 @@ struct streamed_loss_t {
         loss.ladder = ladder, loss.rows = rows, loss.hidden = hidden;
         loss.capabilities = take(device.capabilities_enabled(), "capability query");
         std::size_t const k = ladder.count;
-        std::size_t pack_bytes = 1, workspace_bytes = 1; // a zero-byte tensor would read as a failed allocation
+        // a zero-byte tensor would read as a failed allocation
+        std::size_t pack_bytes = 1, workspace_bytes = 1;
         for (std::uint32_t band = 0; band != k; ++band) {
             std::size_t const width = ladder.width(band);
             pack_bytes = std::max({pack_bytes,
@@ -504,7 +752,8 @@ struct streamed_loss_t {
         launch(&prefix_norms_kernel, rows, block_threads_k, stream, vertices, row_norms.span(), ladder);
     }
 
-    /** Score this rank's rows against @p subgraph , whose first vertex is @p column_base on the global axis. */
+    /** Score this rank's rows against @p subgraph , whose first vertex is @p column_base on the
+     *  global axis. */
     void tile(nk::tensor_view<bf16_t, 2> vertices, nk::tensor_view<bf16_t, 2> subgraph, std::size_t row_base,
               std::size_t column_base, f32_t beta, f32_t bias, f32_t live, nk::stream_t const &stream) noexcept {
         launch(&prefix_norms_kernel, rows, block_threads_k, stream, subgraph, column_norms.span(), ladder);
@@ -523,7 +772,8 @@ struct streamed_loss_t {
                products.view(), forces.span());
     }
 
-    /** Writes the BF16 @p gradient_out and the three @p summands , a multimem payload or any device span. */
+    /** Writes the BF16 @p gradient_out and the three @p summands , a multimem payload or any device
+     *  span. */
     void finish(nk::tensor_view<bf16_t, 2> vertices, nk::tensor_span<bf16_t, 2> gradient_out,
                 nk::tensor_span<f32_t, 1> summands, nk::stream_t const &stream) noexcept {
         launch(&finalize_kernel, rows, block_threads_k, stream, vertices, row_norms.view(), self_coefficients.view(),
@@ -532,7 +782,9 @@ struct streamed_loss_t {
     }
 
   private:
-    /** @c c=a·bᵀ for @p a @b [m,depth], @p b @b [n,depth] and @p c @b [m,n], each with a row stride in scalars. */
+
+    /** @c c=a·bᵀ for @p a @b [m,depth], @p b @b [n,depth] and @p c @b [m,n], each with a row stride
+     *  in scalars. */
     void multiply_(bf16_t const *a, std::size_t a_stride, bf16_t const *b, std::size_t b_stride, f32_t *c,
                    std::size_t c_stride, std::size_t m, std::size_t n, std::size_t depth,
                    nk::stream_t const &stream) noexcept {
