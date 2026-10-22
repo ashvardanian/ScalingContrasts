@@ -100,6 +100,27 @@ NCCL is 2.30.7, the one PyTorch bundles, under nccl-tests v2.21.1 with NVLink SH
 - Below 16 MiB NCCL wins: each collective here costs two barriers and three launches per GPU from one host thread, about 66 µs, which fusing them into one kernel would cut.
 - Keyed integer inputs sum exactly in both collectives, and 1,000 all-reduces of 128 MiB of keyed fractions gave bit-identical results.
 
+## Profile
+
+Nsight Systems 2026.3 traced every CUDA call of `box` runs on one 8-GPU box at R = 4096 and 16384, two windows of three steps each after one warm-up step, so 7 steps per GPU.
+The times below are each kernel's total across those steps, divided by 7 steps and 8 GPUs.
+Nsight Compute could not read the performance counters, which this machine restricts to administrators, so the rates come from each kernel's known work and its measured time.
+
+| Per GPU per step       | R = 4096 | R = 16384 |
+| :--------------------- | -------: | --------: |
+| Forward tile kernel    |  1.85 ms |   28.8 ms |
+| Backward tile kernel   |  1.10 ms |    7.4 ms |
+| Fold of row partials   | 0.034 ms |   0.32 ms |
+| Norms and transpose    |  0.27 ms |   0.95 ms |
+| Peer staging copies    |  0.11 ms |    0.4 ms |
+| Measured step          |  4.43 ms |   39.3 ms |
+
+- The forward kernel scores a 16384² tile in 3.6 ms, which is 1.07 TFLOP of `tcgen05` work at about 300 TFLOP/s, roughly an eighth of B300's quoted dense BF16 rate: its epilogue's arithmetic over 1.34 billion cells and bands, not the MMAs, sets the pace.
+- The backward kernel adds a tile's gradient in 0.93 ms, 0.55 TFLOP at about 590 TFLOP/s, while rereading each band's BF16 gradient matrix once per 64-channel tile, about 8.6 GB, which L2 and HBM serve at over 9 TB/s.
+- The fold of row partials adds each row's 2,048 partials at R = 16384 in 40 µs per tile: eight warps per 32 rows each take every eighth tile, and their totals add in warp order.
+- The multimem all-reduce at the end of a step spends 1.7 ms at R = 4096 waiting, not reducing: one host thread enqueues about 55 calls per GPU, so the last GPU starts its step that much after the first.
+- Staging a peer's candidates over NVLink costs 52 µs per 32 MiB block, under 1% of the step.
+
 ## Footprint and Portability
 
 The binary is 13.4 MB with the C++ runtime linked in, and needs only the CUDA driver, the 0.8 MB `libcudart` shipped beside it, and libibverbs.
