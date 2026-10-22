@@ -22,6 +22,7 @@
 #include <unistd.h>    // `close`, `sysconf`
 
 #include <algorithm> // `std::max`, `std::clamp`
+#include <array>     // `std::array`
 #include <span>      // `std::span`
 #include <tuple>     // `std::tuple`, `std::apply`
 #include <utility>   // `std::exchange`
@@ -32,7 +33,7 @@
 #include <cuda_runtime.h>     // `cudaStream_t`, `cudaMemsetAsync`
 #include <infiniband/verbs.h> // `ibv_reg_dmabuf_mr`, `ibv_post_send`, `ibv_poll_cq`
 
-#include <numkong/numkong.hpp> // `nk::tensor`, `nk::allocator`, `nk::dots_pack`, `nk::dots_packed`
+#include <numkong/numkong.hpp> // `nk::tensor`, `nk::allocator`, `nk::stream_t`, `nk::device_t`
 
 namespace ashvardanian::scalingcontrasts {
 
@@ -734,6 +735,17 @@ __device__ inline void tma_load_(void *destination, CUtensorMap const &map, std:
                  : "memory");
 }
 
+/** Copies the @b [128,64] box at @p row and channel @p depth of matrix @p matrix of @p map into
+ *  @p destination , 128-byte swizzled. */
+__device__ inline void tma_load_(void *destination, CUtensorMap const &map, std::uint32_t depth, std::uint32_t row,
+                                 std::uint32_t matrix, std::uint64_t &barrier) noexcept {
+    asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes " //
+                 "[%0], [%1, {%2, %3, %4}], [%5];"                                                   //
+                 ::"r"(shared_address_(destination)),
+                 "l"(&map), "r"(depth), "r"(row), "r"(matrix), "r"(shared_address_(&barrier))
+                 : "memory");
+}
+
 /** The shared-memory descriptor of a K-major, 128-byte swizzled @b [128,64] stage, @p step k16
  *  steps in. */
 [[nodiscard]] __device__ inline std::uint64_t stage_descriptor_(void const *stage, std::uint32_t step) noexcept {
@@ -921,6 +933,7 @@ static __global__ void __launch_bounds__(fused_threads_k)
     auto const score = [&](std::uint32_t scored_band) {
         if (issuer) tcgen05_commit_(scored);
         mbarrier_wait_(scored, epilogues++ % 2);
+        __syncwarp();
         asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
         score_fused_row_(tile, dots, suffix, scored_band, scored_band + 1 == ladder.count, summands);
         asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
@@ -957,6 +970,100 @@ static __global__ void __launch_bounds__(fused_threads_k)
                      : "memory");
 }
 
+inline constexpr std::uint32_t backward_channels_k = 64; // forces per tile, so every tile lies in one band
+inline constexpr std::uint32_t backward_ring_k = 4;
+inline constexpr std::uint32_t backward_rows_bytes_k = fused_side_k * fused_depth_k * sizeof(bf16_t);
+inline constexpr std::uint32_t backward_columns_bytes_k = backward_channels_k * fused_depth_k * sizeof(bf16_t);
+inline constexpr std::uint32_t backward_shared_bytes_k =
+    backward_ring_k * (backward_rows_bytes_k + backward_columns_bytes_k) + 1024;             // + alignment
+inline constexpr std::uint32_t backward_instruction_k = (1u << 4)                            // Float32 accumulator
+                                                        | (1u << 7) | (1u << 10)             // BF16 A and B
+                                                        | ((backward_channels_k >> 3) << 17) // N
+                                                        | ((fused_side_k >> 4) << 24);       // M
+
+/**
+ *  @brief Adds one @b [128,64] tile of a subgraph's pull on this rank's rows into @p forces : the
+ *      band's BF16 gradient matrix times the subgraph's channels in that band, over every vertex.
+ *
+ *  A TMA warp streams the matrix's rows and the transposed subgraph's channels through a ring of
+ *  @c backward_ring_k stages, one thread issues @c tcgen05 MMAs into tensor memory, and once they
+ *  finish each of four warps adds its 32 rows into the Float32 forces.
+ */
+static __global__ void __launch_bounds__(fused_threads_k)
+    backward_tile_kernel(CUtensorMap const __grid_constant__ gradient_map,
+                         CUtensorMap const __grid_constant__ transposed_map, std::uint32_t stages,
+                         nk::tensor_span<f32_t, 2> forces, matryoshka_t ladder) {
+    extern __shared__ byte_t dynamic_shared[];
+    __shared__ alignas(8) std::uint64_t filled[backward_ring_k], emptied[backward_ring_k], finished;
+    __shared__ std::uint32_t tmem_base;
+    byte_t *const ring = dynamic_shared + (1024 - shared_address_(dynamic_shared) % 1024) % 1024;
+    std::uint32_t const warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    std::uint32_t const channel = blockIdx.x * backward_channels_k, row = blockIdx.y * fused_side_k;
+    std::uint32_t band = 0;
+    while (ladder.ends[band] <= channel) ++band;
+    auto const rows_stage = [&](std::uint32_t slot) { return ring + slot * backward_rows_bytes_k; };
+    auto const columns_stage = [&](std::uint32_t slot) {
+        return ring + backward_ring_k * backward_rows_bytes_k + slot * backward_columns_bytes_k;
+    };
+
+    if (threadIdx.x == 0) {
+        for (std::uint32_t slot = 0; slot != backward_ring_k; ++slot)
+            mbarrier_init_(filled[slot], 1), mbarrier_init_(emptied[slot], 1);
+        mbarrier_init_(finished, 1);
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
+    if (warp == 0) {
+        asm volatile(
+            "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" ::"r"(shared_address_(&tmem_base)),
+            "r"(backward_channels_k)
+            : "memory");
+        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
+    }
+    asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+    __syncthreads();
+    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+
+    if (warp == 4) {
+        if (lane != 0) return;
+        for (std::uint32_t position = 0; position != stages; ++position) {
+            std::uint32_t const slot = position % backward_ring_k;
+            if (position >= backward_ring_k) mbarrier_wait_(emptied[slot], (position / backward_ring_k - 1) % 2);
+            mbarrier_expect_(filled[slot], backward_rows_bytes_k + backward_columns_bytes_k);
+            tma_load_(rows_stage(slot), gradient_map, position * fused_depth_k, row, band, filled[slot]);
+            tma_load_(columns_stage(slot), transposed_map, position * fused_depth_k, channel, filled[slot]);
+        }
+        return;
+    }
+
+    if (threadIdx.x == 0) {
+        for (std::uint32_t position = 0; position != stages; ++position) {
+            std::uint32_t const slot = position % backward_ring_k;
+            mbarrier_wait_(filled[slot], position / backward_ring_k % 2);
+            asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+            for (std::uint32_t step = 0; step != fused_depth_k / 16; ++step)
+                tcgen05_mma_(tmem_base & 0xFFFFu, stage_descriptor_(rows_stage(slot), step),
+                             stage_descriptor_(columns_stage(slot), step), backward_instruction_k, position | step);
+            tcgen05_commit_(emptied[slot]);
+        }
+        tcgen05_commit_(finished);
+    }
+    mbarrier_wait_(finished, 0);
+    __syncwarp();
+    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+    for (std::uint32_t chunk = 0; chunk != backward_channels_k / fused_chunk_k; ++chunk) {
+        f32_t pulls[fused_chunk_k];
+        tmem_load_(tmem_base + (warp * 32 << 16) + chunk * fused_chunk_k, pulls);
+#pragma unroll
+        for (std::uint32_t cell = 0; cell != fused_chunk_k; ++cell)
+            forces[row + threadIdx.x, channel + chunk * fused_chunk_k + cell] += pulls[cell];
+    }
+    asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+    asm volatile("bar.sync 1, 128;" ::: "memory");
+    if (warp == 0)
+        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" ::"r"(tmem_base), "r"(backward_channels_k)
+                     : "memory");
+}
+
 /** Adds each row's column-tile @p partials , in tile order, to its @p scalars and
  *  @p self_coefficients . */
 static __global__ void fold_partials_kernel(nk::tensor_view<f32_t, 3> partials, nk::tensor_span<f32_t, 2> scalars,
@@ -969,13 +1076,6 @@ static __global__ void fold_partials_kernel(nk::tensor_view<f32_t, 3> partials, 
         if (quantity < 3) scalars[quantity, row] += total;
         else self_coefficients[quantity - 3, row] += total;
     }
-}
-
-static __global__ void add_kernel(nk::tensor_view<f32_t, 2> addend, nk::tensor_span<f32_t, 2> accumulator) {
-    std::size_t const columns = accumulator.extent(1), total = accumulator.extent(0) * columns;
-    for (std::size_t cell = blockIdx.x * std::size_t {blockDim.x} + threadIdx.x; cell < total;
-         cell += std::size_t {gridDim.x} * blockDim.x)
-        accumulator[cell / columns, cell % columns] += addend[cell / columns, cell % columns];
 }
 
 /** The cosine's self term folded into the forces, then the BF16 gradient. */
@@ -1023,11 +1123,10 @@ struct streamed_loss_t {
     matryoshka_t ladder;
     std::size_t rows = 0, hidden = 0;
     nk_capability_t capabilities = 0;
-    nk::tensor<f32_t, nk::allocator<f32_t>, 2> row_norms, column_norms, products, forces, scalars, self_coefficients;
+    nk::tensor<f32_t, nk::allocator<f32_t>, 2> row_norms, column_norms, forces, scalars, self_coefficients;
     nk::tensor<f32_t, nk::allocator<f32_t>, 3> partials;
     nk::tensor<bf16_t, nk::allocator<bf16_t>, 3> gradient;
     nk::tensor<bf16_t, nk::allocator<bf16_t>, 2> transposed, staged;
-    nk::tensor<byte_t, nk::allocator<byte_t>, 1> packed, workspace;
 
     [[nodiscard]] static streamed_loss_t make(nk::device_t device, nk::stream_t const &stream, std::size_t rows,
                                               std::size_t hidden, matryoshka_t ladder) noexcept {
@@ -1036,27 +1135,19 @@ struct streamed_loss_t {
         loss.capabilities = take(device.capabilities_enabled(), "capability query");
         std::size_t const k = ladder.count;
         bool const edges_fit = std::all_of(ladder.ends, ladder.ends + k,
-                                           [](std::uint32_t end) { return end % 16 == 0; });
+                                           [](std::uint32_t end) { return end % backward_channels_k == 0; });
         require(rows % fused_side_k == 0 && hidden % fused_depth_k == 0 && edges_fit && ladder.ends[k - 1] == hidden
                     ? 0
                     : EINVAL,
-                "fused tile shape, which takes rows in multiples of 128, channels in 64 and band edges in 16");
+                "fused tile shape, which takes rows in multiples of 128, and channels and band edges in 64");
         require(cudaFuncSetAttribute(&matryoshka_tile_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                      int(fused_shared_bytes_k)),
                 "fused tile shared memory");
-        // a zero-byte tensor would read as a failed allocation
-        std::size_t pack_bytes = 1, workspace_bytes = 1;
-        for (std::uint32_t band = 0; band != k; ++band) {
-            std::size_t const width = ladder.width(band);
-            pack_bytes = std::max(pack_bytes,
-                                  take(nk::dots_pack_size<nk::bf16_t>(width, rows, loss.capabilities), "pack size"));
-            workspace_bytes = std::max(
-                workspace_bytes, take(nk::dots_packed_workspace_size<nk::bf16_t>(rows, width, rows, loss.capabilities),
-                                      "workspace size"));
-        }
+        require(cudaFuncSetAttribute(&backward_tile_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     int(backward_shared_bytes_k)),
+                "backward tile shared memory");
         loss.row_norms = make_tensor<f32_t, 2>(loss.capabilities, stream, {k, rows});
         loss.column_norms = make_tensor<f32_t, 2>(loss.capabilities, stream, {k, rows});
-        loss.products = make_tensor<f32_t, 2>(loss.capabilities, stream, {rows, hidden});
         loss.forces = make_tensor<f32_t, 2>(loss.capabilities, stream, {rows, hidden});
         loss.scalars = make_tensor<f32_t, 2>(loss.capabilities, stream, {3, rows});
         loss.self_coefficients = make_tensor<f32_t, 2>(loss.capabilities, stream, {k, rows});
@@ -1064,18 +1155,15 @@ struct streamed_loss_t {
         loss.gradient = make_tensor<bf16_t, 3>(loss.capabilities, stream, {k, rows, rows});
         loss.transposed = make_tensor<bf16_t, 2>(loss.capabilities, stream, {hidden, rows});
         loss.staged = make_tensor<bf16_t, 2>(loss.capabilities, stream, {rows, hidden});
-        loss.packed = make_tensor<byte_t, 1>(loss.capabilities, stream, {pack_bytes});
-        loss.workspace = make_tensor<byte_t, 1>(loss.capabilities, stream, {workspace_bytes});
         return loss;
     }
 
     /** Device bytes the loss holds, independent of the world's size. */
     [[nodiscard]] std::size_t bytes() const noexcept {
-        return (row_norms.numel() + column_norms.numel() + products.numel() + forces.numel() + scalars.numel() +
+        return (row_norms.numel() + column_norms.numel() + forces.numel() + scalars.numel() +
                 self_coefficients.numel() + partials.numel()) *
                    sizeof(f32_t) +
-               (gradient.numel() + transposed.numel() + staged.numel()) * sizeof(bf16_t) + packed.numel() +
-               workspace.numel();
+               (gradient.numel() + transposed.numel() + staged.numel()) * sizeof(bf16_t);
     }
 
     void begin(nk::tensor_view<bf16_t, 2> vertices, nk::stream_t const &stream) noexcept {
@@ -1103,15 +1191,16 @@ struct streamed_loss_t {
             row_norms.view(), column_norms.view(), gradient.span(), partials.span(), row_base, column_base, beta, bias,
             1.0f / live};
         launch(&matryoshka_tile_kernel, dim3 {tiles, tiles}, fused_threads_k, fused_shared_bytes_k, stream,
-               tensor_map_(vertices), tensor_map_(staged.span()), static_cast<std::uint32_t>(hidden / fused_depth_k),
-               tile, ladder);
+               tensor_map_<2>(vertices.data(), {hidden, rows}, {fused_depth_k, fused_side_k}),
+               tensor_map_<2>(staged.data(), {hidden, rows}, {fused_depth_k, fused_side_k}),
+               static_cast<std::uint32_t>(hidden / fused_depth_k), tile, ladder);
         launch(&fold_partials_kernel, divide_round_up(rows, block_threads_k), block_threads_k, stream, partials.view(),
                scalars.span(), self_coefficients.span());
-        for (std::uint32_t band = 0; band != ladder.count; ++band)
-            multiply_(gradient.data() + band * rows * rows, rows, transposed.data() + ladder.begin(band) * rows, rows,
-                      products.data() + ladder.begin(band), hidden, rows, ladder.width(band), rows, stream);
-        launch(&add_kernel, divide_round_up(rows * hidden, block_threads_k), block_threads_k, stream, products.view(),
-               forces.span());
+        launch(&backward_tile_kernel, dim3 {static_cast<std::uint32_t>(hidden / backward_channels_k), tiles},
+               fused_threads_k, backward_shared_bytes_k, stream,
+               tensor_map_<3>(gradient.data(), {rows, rows, ladder.count}, {fused_depth_k, fused_side_k, 1}),
+               tensor_map_<2>(transposed.data(), {rows, hidden}, {fused_depth_k, backward_channels_k}),
+               static_cast<std::uint32_t>(rows / fused_depth_k), forces.span(), ladder);
     }
 
     /** Writes the BF16 @p gradient_out and the three @p summands , a multimem payload or any device
@@ -1125,31 +1214,23 @@ struct streamed_loss_t {
 
   private:
 
-    /** The TMA map of a K-major @b [rows,hidden] tower in @b [128,64] boxes, 128-byte swizzled. */
-    [[nodiscard]] CUtensorMap tensor_map_(nk::tensor_span<bf16_t, 2> tower) const noexcept {
+    /** The TMA map of a row-major BF16 tensor at @p data with @p extents , innermost first, read in
+     *  @p box boxes, 128-byte swizzled. */
+    template <std::size_t rank_>
+    [[nodiscard]] static CUtensorMap tensor_map_(bf16_t *data, std::array<std::uint64_t, rank_> extents,
+                                                 std::array<std::uint32_t, rank_> box) noexcept {
         CUtensorMap map;
-        std::uint64_t const extents[2] = {hidden, rows}, strides[1] = {hidden * sizeof(bf16_t)};
-        std::uint32_t const box[2] = {fused_depth_k, fused_side_k}, steps[2] = {1, 1};
-        require(cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, tower.data(), extents, strides, box,
-                                       steps, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+        std::uint64_t strides[rank_ - 1];
+        std::uint32_t steps[rank_];
+        for (std::size_t dimension = 0; dimension != rank_; ++dimension) steps[dimension] = 1;
+        strides[0] = extents[0] * sizeof(bf16_t);
+        for (std::size_t dimension = 1; dimension + 1 < rank_; ++dimension)
+            strides[dimension] = strides[dimension - 1] * extents[dimension];
+        require(cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, rank_, data, extents.data(), strides,
+                                       box.data(), steps, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
                                        CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
                 "tensor map");
         return map;
-    }
-
-    /** @c c=a·bᵀ for @p a @b [m,depth], @p b @b [n,depth] and @p c @b [m,n], each with a row stride
-     *  in scalars. */
-    void multiply_(bf16_t const *a, std::size_t a_stride, bf16_t const *b, std::size_t b_stride, f32_t *c,
-                   std::size_t c_stride, std::size_t m, std::size_t n, std::size_t depth,
-                   nk::stream_t const &stream) noexcept {
-        require(nk::dots_pack<nk::bf16_t>(reinterpret_cast<nk::bf16_t const *>(b), n, depth, b_stride * sizeof(bf16_t),
-                                          packed.data(), capabilities, stream.get()),
-                "pack");
-        require(nk::dots_packed<nk::bf16_t>(
-                    reinterpret_cast<nk::bf16_t const *>(a), packed.data(), reinterpret_cast<nk::f32_t *>(c), m, n,
-                    depth, a_stride * sizeof(bf16_t), c_stride * sizeof(f32_t),
-                    std::span<byte_t> {workspace.data(), workspace.numel()}, capabilities, stream.get()),
-                "product");
     }
 };
 

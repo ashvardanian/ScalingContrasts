@@ -22,6 +22,7 @@ Every number below comes from this repository, on one or two 8× B300 SXM6 boxes
 - __Matryoshka in one product.__
   A `tcgen05` kernel for B300 streams both operands through TMA into a ring of 128-byte swizzled stages and accumulates every cell's full dot in tensor memory, then sweeps back with negated rows, meeting the band edges widest first.
   At each edge four warps score their rows straight out of tensor memory, where each band's suffix-summed gradient also lives, so no Float32 `[K, R, R]` of products ever reaches HBM.
+  The gradient's products take the same path: TMA streams each band's BF16 gradient matrix and the transposed embeddings into `tcgen05` MMAs, which add straight into the Float32 forces.
 - __Streamed, row-owned sigmoid loss.__
   Each peer's `[K, R, R]` tile of Matryoshka cosines is scored, lossed and folded into the GPU's own forces before the next one, so memory does not grow with the world.
   Cell `(i, j)` and its mirror `(j, i)` share the cosine, target and weight, so the owner of `i` differentiates both, and the backward exchanges nothing.
@@ -43,29 +44,29 @@ The baselines, every one differentiating the same Matryoshka prefixes:
 
 | 8 GPUs, step | Streamed | open_clip bidir | open_clip gather | open_clip CLIP | big_vision |
 | :----------- | -------: | --------------: | ---------------: | -------------: | ---------: |
-| R = 1024     |  5.33 ms |         26.4 ms |          22.8 ms |        11.0 ms |    3.18 ms |
-| R = 4096     |  8.71 ms |         27.3 ms |          26.1 ms |        83.0 ms |    5.51 ms |
-| R = 16384    |  83.2 ms |          142 ms |           153 ms | out of memory  |    72.8 ms |
+| R = 1024     |  2.06 ms |         26.4 ms |          22.8 ms |        11.0 ms |    3.18 ms |
+| R = 4096     |  7.17 ms |         27.3 ms |          26.1 ms |        83.0 ms |    5.51 ms |
+| R = 16384    |  82.1 ms |          142 ms |           153 ms | out of memory  |    72.8 ms |
 
 | 8 GPUs, memory | Streamed | open_clip bidir | open_clip gather | open_clip CLIP | big_vision |
 | :------------- | -------: | --------------: | ---------------: | -------------: | ---------: |
-| R = 1024       |    41 MB |          241 MB |           270 MB |        1.71 GB |     443 MB |
-| R = 4096       |   244 MB |         3.03 GB |          3.40 GB |        26.2 GB |    5.28 GB |
-| R = 16384      |  2.97 GB |         45.1 GB |          50.6 GB | out of memory  |    48.2 GB |
+| R = 1024       |    19 MB |          241 MB |           270 MB |        1.71 GB |     443 MB |
+| R = 4096       |   206 MB |         3.03 GB |          3.40 GB |        26.2 GB |    5.28 GB |
+| R = 16384      |  2.89 GB |         45.1 GB |          50.6 GB | out of memory  |    48.2 GB |
 
 Across two such boxes, one process per box and eight 100 Gb/s RoCE rails between them:
 
 | 16 GPUs, step | Streamed | open_clip bidir | open_clip gather | open_clip CLIP | big_vision |
 | :------------ | -------: | --------------: | ---------------: | -------------: | ---------: |
-| R = 1024      |  11.1 ms |         45.7 ms |          39.3 ms |        25.4 ms |    3.72 ms |
-| R = 4096      |  18.6 ms |         49.4 ms |          42.0 ms |         333 ms |    12.7 ms |
-| R = 16384     |   167 ms |          362 ms |           305 ms | out of memory  |     152 ms |
+| R = 1024      |  4.49 ms |         45.7 ms |          39.3 ms |        25.4 ms |    3.72 ms |
+| R = 4096      |  14.6 ms |         49.4 ms |          42.0 ms |         333 ms |    12.7 ms |
+| R = 16384     |   164 ms |          362 ms |           305 ms | out of memory  |     152 ms |
 
 | 16 GPUs, memory | Streamed | open_clip bidir | open_clip gather | open_clip CLIP | big_vision |
 | :-------------- | -------: | --------------: | ---------------: | -------------: | ---------: |
-| R = 1024        |    45 MB |          474 MB |           503 MB |        6.64 GB |     881 MB |
-| R = 4096        |   260 MB |         5.97 GB |          6.34 GB |         104 GB |    12.7 GB |
-| R = 16384       |  3.04 GB |         89.1 GB |          94.6 GB | out of memory  |    96.2 GB |
+| R = 1024        |    23 MB |          474 MB |           503 MB |        6.64 GB |     881 MB |
+| R = 4096        |   223 MB |         5.97 GB |          6.34 GB |         104 GB |    12.7 GB |
+| R = 16384       |  2.95 GB |         89.1 GB |          94.6 GB | out of memory  |    96.2 GB |
 
 big_vision is the fastest at every size: XLA turns each device's whole loss into one large product and fuses the rest, at 11 to 49 times the streamed loss's memory.
 open_clip's CLIP loss runs out of 268 GB at R = 16384, where its logits and their softmax grow with the world.
@@ -73,9 +74,9 @@ open_clip's CLIP loss runs out of 268 GB at R = 16384, where its logits and thei
 Each GPU scores its host's eight towers while the other host's eight are in flight, then scores those once they land.
 The memory adds the two landings per GPU to the loss's own tile.
 
-One rank of a 72-GPU world, simulated on one GPU at R = 4096, takes 62.6 ms and 244 MB.
+One rank of a 72-GPU world, simulated on one GPU at R = 4096, takes 56.8 ms and 206 MB.
 PyTorch's simulated rank takes 101 ms and 26.6 GB in BF16.
-The streamed loss holds the same 244 MB at 8, 72 or 144 GPUs.
+The streamed loss holds the same 206 MB at 8, 72 or 144 GPUs.
 
 Against a Float64 evaluation of the whole 8-GPU world at R = 128, the loss matches to 2e-7 relative, and the gradient to 0.23% relative L2, the BF16 rounding of its operands.
 The summands reach every GPU through one multimem all-reduce, and every GPU holds the same loss.
