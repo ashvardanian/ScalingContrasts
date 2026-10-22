@@ -48,6 +48,7 @@ using f64_t = double;
 
 inline constexpr std::uint32_t block_threads_k = 256;
 inline constexpr f32_t cosine_floor_k = 1.0e-2f; // smaller norm products read as zero cosines
+inline constexpr f32_t inverse_cosine_floor_k = 1.0f / cosine_floor_k;
 
 /** The smallest count of @p divisor -sized pieces that covers @p value . */
 [[nodiscard]] constexpr std::size_t divide_round_up(std::size_t value, std::size_t divisor) noexcept {
@@ -668,19 +669,19 @@ static __global__ void transpose_kernel(nk::tensor_view<bf16_t, 2> source, nk::t
             destination[candidate_base + step, query_base + threadIdx.x] = tile[threadIdx.x][step];
 }
 
-static __global__ void prefix_norms_kernel(nk::tensor_view<bf16_t, 2> queries, nk::tensor_span<f32_t, 2> norms,
-                                           matryoshka_t ladder) {
+static __global__ void prefix_inverse_norms_kernel(nk::tensor_view<bf16_t, 2> embeddings,
+                                                   nk::tensor_span<f32_t, 2> norms, matryoshka_t ladder) {
     std::size_t const row = blockIdx.x;
     f32_t running = 0.0f;
     for (std::uint32_t band = 0; band != ladder.count; ++band) {
         f32_t partial = 0.0f;
         for (std::uint32_t channel = ladder.begin(band) + threadIdx.x; channel < ladder.ends[band];
              channel += blockDim.x) {
-            f32_t const value = __bfloat162float(queries[row, channel]);
+            f32_t const value = __bfloat162float(embeddings[row, channel]);
             partial += value * value;
         }
         running += block_sum(partial);
-        if (threadIdx.x == 0) norms[band, row] = std::sqrt(running);
+        if (threadIdx.x == 0) norms[band, row] = 1.0f / std::sqrt(running);
     }
 }
 
@@ -706,7 +707,7 @@ inline constexpr std::uint32_t forward_negated_instruction_k = forward_instructi
 
 /** What every forward tile of one candidate block shares. */
 struct forward_tile_t {
-    nk::tensor_view<f32_t, 2> query_norms, candidate_norms;
+    nk::tensor_view<f32_t, 2> query_inverse_norms, candidate_inverse_norms;
     nk::tensor_span<bf16_t, 3> similarity_gradients;
     nk::tensor_span<f32_t, 3> row_partials;
     std::size_t query_base, candidate_base;
@@ -831,6 +832,16 @@ __device__ inline void tmem_store_(std::uint32_t address, f32_t const (&values)[
     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
 }
 
+/** @c log(1+x) for @p x in @b [0,1], as @p x times a degree-8 Chebyshev least-squares fit of
+ *  @c log1p(x)/x on that interval, within 3.2e-7 of it relative in Float32. */
+[[nodiscard]] __device__ inline f32_t log1p_unit_(f32_t x) noexcept {
+    f32_t fit = 5.185916197e-03f;
+    for (f32_t const coefficient : {-2.920989730e-02f, 7.753973263e-02f, -1.358388136e-01f, 1.905592322e-01f,
+                                    -2.482563861e-01f, 3.331600901e-01f, -4.999925577e-01f, 9.999999208e-01f})
+        fit = std::fma(fit, x, coefficient);
+    return fit * x;
+}
+
 /** This lane's row summands of a forward tile. */
 struct forward_row_t {
     f32_t loss = 0, bias_grad = 0, log_beta_grad = 0;
@@ -845,7 +856,7 @@ __device__ inline void score_forward_row_(forward_tile_t const &tile, std::uint3
                                           forward_row_t &summands) noexcept {
     std::uint32_t const local_row = threadIdx.x % 128;
     std::size_t const row = std::size_t {blockIdx.y} * forward_side_k + local_row;
-    f32_t const row_norm = tile.query_norms[band, row];
+    f32_t const row_inverse_norm = tile.query_inverse_norms[band, row];
     f32_t coefficient = 0;
     for (std::uint32_t chunk = half * forward_halves_chunks_k; chunk != (half + 1) * forward_halves_chunks_k; ++chunk) {
         f32_t similarities[forward_chunk_k], swept[forward_chunk_k], running[forward_chunk_k];
@@ -861,8 +872,11 @@ __device__ inline void score_forward_row_(forward_tile_t const &tile, std::uint3
         for (std::uint32_t cell = 0; cell != forward_chunk_k; ++cell) {
             std::size_t const column = first_column + cell;
             bool const own_copy = tile.query_base + row == tile.candidate_base + column;
-            f32_t const denominator = row_norm * tile.candidate_norms[band, column];
-            f32_t const cosine = denominator > cosine_floor_k ? __fdividef(similarities[cell], denominator) : 0.0f;
+            // The inverse of the norms' product, clamped where they read as a zero cosine.
+            f32_t const inverse_denominator = std::fmin(row_inverse_norm * tile.candidate_inverse_norms[band, column],
+                                                        inverse_cosine_floor_k);
+            f32_t const cosine = inverse_denominator < inverse_cosine_floor_k ? similarities[cell] * inverse_denominator
+                                                                              : 0.0f;
             // A query's cosine with its own copy is one, whatever its raw dot rounds to.
             f32_t const logit = tile.beta * (own_copy ? 1.0f : cosine);
             f32_t const target = own_copy ? 1.0f : -1.0f;
@@ -870,12 +884,11 @@ __device__ inline void score_forward_row_(forward_tile_t const &tile, std::uint3
             f32_t const decay = __expf(-std::fabs(signed_logit));
             f32_t const complement = __fdividef(signed_logit >= 0.0f ? decay : 1.0f, 1.0f + decay); // 1 - sigmoid
             f32_t const cell_grad = -tile.weight * target * complement;
-            summands.loss += tile.weight * (std::fmax(-signed_logit, 0.0f) + std::log1p(decay));
+            summands.loss += tile.weight * (std::fmax(-signed_logit, 0.0f) + log1p_unit_(decay));
             summands.bias_grad += cell_grad;
             summands.log_beta_grad += cell_grad * logit;
             // The mirror cell (j, i) moves v_i the same way, and the own copy moves nothing.
-            f32_t const raw_grad =
-                own_copy ? 0.0f : __fdividef(2.0f * tile.beta * cell_grad, std::fmax(denominator, cosine_floor_k));
+            f32_t const raw_grad = own_copy ? 0.0f : 2.0f * tile.beta * cell_grad * inverse_denominator;
             coefficient += raw_grad * similarities[cell];
             running[cell] += raw_grad;
             if (cell % 2)
@@ -890,7 +903,7 @@ __device__ inline void score_forward_row_(forward_tile_t const &tile, std::uint3
                          "r"(packed[quarter * 4 + 3])
                          : "memory");
     }
-    tile.row_partials[3 + band, row, blockIdx.x * 2 + half] = coefficient;
+    tile.row_partials[3 + band, blockIdx.x * 2 + half, row] = coefficient;
 }
 
 /** The stages one segment of a forward tile sweeps, and the MMA that sweeps them. */
@@ -917,7 +930,7 @@ struct forward_segment_t {
  *  into the other of two TMEM segment buffers, so the MMA warp sweeps the next segment while eight
  *  epilogue warps fold the last one into the raw dots and score its band. Each band's
  *  suffix-summed gradient stays in TMEM beside the dots. Row summands land in the tile's
- *  @b [3+K,R,R/64] partials, which @ref fold_partials_kernel adds in order.
+ *  @b [3+K,R/64,R] partials, which @ref fold_partials_kernel adds in order.
  */
 static __global__ void __launch_bounds__(forward_threads_k, 1)
     forward_tile_kernel(CUtensorMap const __grid_constant__ rows_map, CUtensorMap const __grid_constant__ columns_map,
@@ -1013,9 +1026,9 @@ static __global__ void __launch_bounds__(forward_threads_k, 1)
     }
 
     std::size_t const row = std::size_t {blockIdx.y} * forward_side_k + quarter * 32 + lane;
-    tile.row_partials[0, row, blockIdx.x * 2 + half] = summands.loss;
-    tile.row_partials[1, row, blockIdx.x * 2 + half] = summands.bias_grad;
-    tile.row_partials[2, row, blockIdx.x * 2 + half] = summands.log_beta_grad;
+    tile.row_partials[0, blockIdx.x * 2 + half, row] = summands.loss;
+    tile.row_partials[1, blockIdx.x * 2 + half, row] = summands.bias_grad;
+    tile.row_partials[2, blockIdx.x * 2 + half, row] = summands.log_beta_grad;
     asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
     asm volatile("bar.sync 1, %0;" ::"n"(forward_epilogue_warps_k * 32) : "memory");
     if (warp == forward_first_epilogue_warp_k)
@@ -1126,17 +1139,17 @@ static __global__ void fold_partials_kernel(nk::tensor_view<f32_t, 3> row_partia
                                             nk::tensor_span<f32_t, 2> summand_rows,
                                             nk::tensor_span<f32_t, 2> self_coefficients) {
     std::size_t const row = blockIdx.x * std::size_t {blockDim.x} + threadIdx.x;
-    if (row >= row_partials.extent(1)) return;
+    if (row >= row_partials.extent(2)) return;
     for (std::size_t quantity = 0; quantity != row_partials.extent(0); ++quantity) {
         f32_t total = 0.0f;
-        for (std::size_t tile = 0; tile != row_partials.extent(2); ++tile) total += row_partials[quantity, row, tile];
+        for (std::size_t tile = 0; tile != row_partials.extent(1); ++tile) total += row_partials[quantity, tile, row];
         if (quantity < 3) summand_rows[quantity, row] += total;
         else self_coefficients[quantity - 3, row] += total;
     }
 }
 
 /** The cosine's self term folded into the query gradient, then its BF16 copy. */
-static __global__ void finalize_kernel(nk::tensor_view<bf16_t, 2> queries, nk::tensor_view<f32_t, 2> norms,
+static __global__ void finalize_kernel(nk::tensor_view<bf16_t, 2> queries, nk::tensor_view<f32_t, 2> inverse_norms,
                                        nk::tensor_view<f32_t, 2> self_coefficients,
                                        nk::tensor_view<f32_t, 2> query_gradient,
                                        nk::tensor_span<bf16_t, 2> gradient_out, matryoshka_t ladder) {
@@ -1145,7 +1158,8 @@ static __global__ void finalize_kernel(nk::tensor_view<bf16_t, 2> queries, nk::t
         f32_t fold = 0.0f;
         for (std::uint32_t band = 0; band != ladder.count; ++band)
             if (channel < ladder.ends[band])
-                fold += self_coefficients[band, row] / std::fmax(norms[band, row] * norms[band, row], cosine_floor_k);
+                fold += self_coefficients[band, row] *
+                        std::fmin(inverse_norms[band, row] * inverse_norms[band, row], inverse_cosine_floor_k);
         gradient_out[row, channel] = __float2bfloat16(query_gradient[row, channel] -
                                                       fold * __bfloat162float(queries[row, channel]));
     }
@@ -1184,8 +1198,8 @@ struct streamed_loss_t {
     matryoshka_t ladder;
     std::size_t rows = 0, hidden = 0;
     nk_capability_t capabilities = 0;
-    nk::tensor<f32_t, nk::allocator<f32_t>, 2> query_norms, candidate_norms, query_gradient, summand_rows,
-        self_coefficients;
+    nk::tensor<f32_t, nk::allocator<f32_t>, 2> query_inverse_norms, candidate_inverse_norms, query_gradient,
+        summand_rows, self_coefficients;
     nk::tensor<f32_t, nk::allocator<f32_t>, 3> row_partials;
     nk::tensor<bf16_t, nk::allocator<bf16_t>, 3> similarity_gradients;
     nk::tensor<bf16_t, nk::allocator<bf16_t>, 2> transposed_candidates, staged_candidates;
@@ -1208,12 +1222,12 @@ struct streamed_loss_t {
         require(cudaFuncSetAttribute(&backward_tile_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                      int(backward_shared_bytes_k)),
                 "backward tile shared memory");
-        loss.query_norms = make_tensor<f32_t, 2>(loss.capabilities, stream, {k, rows});
-        loss.candidate_norms = make_tensor<f32_t, 2>(loss.capabilities, stream, {k, rows});
+        loss.query_inverse_norms = make_tensor<f32_t, 2>(loss.capabilities, stream, {k, rows});
+        loss.candidate_inverse_norms = make_tensor<f32_t, 2>(loss.capabilities, stream, {k, rows});
         loss.query_gradient = make_tensor<f32_t, 2>(loss.capabilities, stream, {rows, hidden});
         loss.summand_rows = make_tensor<f32_t, 2>(loss.capabilities, stream, {3, rows});
         loss.self_coefficients = make_tensor<f32_t, 2>(loss.capabilities, stream, {k, rows});
-        loss.row_partials = make_tensor<f32_t, 3>(loss.capabilities, stream, {3 + k, rows, 2 * rows / forward_side_k});
+        loss.row_partials = make_tensor<f32_t, 3>(loss.capabilities, stream, {3 + k, 2 * rows / forward_side_k, rows});
         loss.similarity_gradients = make_tensor<bf16_t, 3>(loss.capabilities, stream, {k, rows, rows});
         loss.transposed_candidates = make_tensor<bf16_t, 2>(loss.capabilities, stream, {hidden, rows});
         loss.staged_candidates = make_tensor<bf16_t, 2>(loss.capabilities, stream, {rows, hidden});
@@ -1222,8 +1236,8 @@ struct streamed_loss_t {
 
     /** Device bytes the loss holds, independent of the world's size. */
     [[nodiscard]] std::size_t bytes() const noexcept {
-        return (query_norms.numel() + candidate_norms.numel() + query_gradient.numel() + summand_rows.numel() +
-                self_coefficients.numel() + row_partials.numel()) *
+        return (query_inverse_norms.numel() + candidate_inverse_norms.numel() + query_gradient.numel() +
+                summand_rows.numel() + self_coefficients.numel() + row_partials.numel()) *
                    sizeof(f32_t) +
                (similarity_gradients.numel() + transposed_candidates.numel() + staged_candidates.numel()) *
                    sizeof(bf16_t);
@@ -1237,7 +1251,8 @@ struct streamed_loss_t {
                 "zeroing summands");
         require(cudaMemsetAsync(self_coefficients.data(), 0, self_coefficients.numel() * sizeof(f32_t), cuda),
                 "zeroing coefficients");
-        launch(&prefix_norms_kernel, rows, block_threads_k, stream, queries, query_norms.span(), ladder);
+        launch(&prefix_inverse_norms_kernel, rows, block_threads_k, stream, queries, query_inverse_norms.span(),
+               ladder);
     }
 
     /** Scores this rank's @p queries against @p candidates , whose first is @p candidate_base on
@@ -1248,14 +1263,14 @@ struct streamed_loss_t {
         require(cudaMemcpyAsync(staged_candidates.data(), candidates.data(), staged_candidates.numel() * sizeof(bf16_t),
                                 cudaMemcpyDefault, cuda_stream(stream)),
                 "candidate staging");
-        launch(&prefix_norms_kernel, rows, block_threads_k, stream, staged_candidates.view(), candidate_norms.span(),
-               ladder);
+        launch(&prefix_inverse_norms_kernel, rows, block_threads_k, stream, staged_candidates.view(),
+               candidate_inverse_norms.span(), ladder);
         dim3 const transpose_grid {static_cast<std::uint32_t>(hidden / 32), static_cast<std::uint32_t>(rows / 32)};
         launch(&transpose_kernel, transpose_grid, dim3 {32, 8}, stream, staged_candidates.view(),
                transposed_candidates.span());
         std::uint32_t const tiles = static_cast<std::uint32_t>(rows / forward_side_k);
-        forward_tile_t const tile {query_norms.view(),
-                                   candidate_norms.view(),
+        forward_tile_t const tile {query_inverse_norms.view(),
+                                   candidate_inverse_norms.view(),
                                    similarity_gradients.span(),
                                    row_partials.span(),
                                    query_base,
@@ -1281,8 +1296,8 @@ struct streamed_loss_t {
      *  span. */
     void finish(nk::tensor_view<bf16_t, 2> queries, nk::tensor_span<bf16_t, 2> gradient_out,
                 nk::tensor_span<f32_t, 1> summands, nk::stream_t const &stream) noexcept {
-        launch(&finalize_kernel, rows, block_threads_k, stream, queries, query_norms.view(), self_coefficients.view(),
-               query_gradient.view(), gradient_out, ladder);
+        launch(&finalize_kernel, rows, block_threads_k, stream, queries, query_inverse_norms.view(),
+               self_coefficients.view(), query_gradient.view(), gradient_out, ladder);
         launch(&sum_summands_kernel, 1, block_threads_k, stream, summand_rows.view(), summands);
     }
 

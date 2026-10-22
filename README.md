@@ -44,9 +44,9 @@ The baselines, every one differentiating the same Matryoshka prefixes:
 
 | 8 GPUs, step | Streamed | open_clip bidir | open_clip gather | open_clip CLIP | big_vision |
 | :----------- | -------: | --------------: | ---------------: | -------------: | ---------: |
-| R = 1024     |  1.87 ms |         26.4 ms |          22.8 ms |        11.0 ms |    3.27 ms |
-| R = 4096     |  6.46 ms |         27.3 ms |          26.1 ms |        83.0 ms |    8.18 ms |
-| R = 16384    |  69.1 ms |          142 ms |           153 ms | out of memory  |     106 ms |
+| R = 1024     |  1.89 ms |         26.4 ms |          22.8 ms |        11.0 ms |    3.27 ms |
+| R = 4096     |  4.17 ms |         27.3 ms |          26.1 ms |        83.0 ms |    8.18 ms |
+| R = 16384    |  39.0 ms |          142 ms |           153 ms | out of memory  |     106 ms |
 
 | 8 GPUs, memory | Streamed | open_clip bidir | open_clip gather | open_clip CLIP | big_vision |
 | :------------- | -------: | --------------: | ---------------: | -------------: | ---------: |
@@ -58,9 +58,9 @@ Across two such boxes, one process per box. NVLink joins only the eight GPUs ins
 
 | 16 GPUs, step | Streamed | open_clip bidir | open_clip gather | open_clip CLIP | big_vision |
 | :------------ | -------: | --------------: | ---------------: | -------------: | ---------: |
-| R = 1024      |  4.16 ms |         45.7 ms |          39.3 ms |        25.4 ms |    4.57 ms |
-| R = 4096      |  13.1 ms |         49.4 ms |          42.0 ms |         333 ms |    20.9 ms |
-| R = 16384     |   139 ms |          362 ms |           305 ms | out of memory  |     223 ms |
+| R = 1024      |  3.62 ms |         45.7 ms |          39.3 ms |        25.4 ms |    4.57 ms |
+| R = 4096      |  9.72 ms |         49.4 ms |          42.0 ms |         333 ms |    20.9 ms |
+| R = 16384     |  77.7 ms |          362 ms |           305 ms | out of memory  |     223 ms |
 
 | 16 GPUs, memory | Streamed | open_clip bidir | open_clip gather | open_clip CLIP | big_vision |
 | :-------------- | -------: | --------------: | ---------------: | -------------: | ---------: |
@@ -74,7 +74,7 @@ open_clip's CLIP loss runs out of 268 GB at R = 16384, where its logits and thei
 Each GPU scores its host's eight towers while the other host's eight are in flight, then scores those once they land.
 The memory adds the two landings per GPU to the loss's own tile.
 
-One rank of a 72-GPU world, simulated on one GPU at R = 4096, takes 50.5 ms and 210 MB.
+One rank of a 72-GPU world, simulated on one GPU at R = 4096, takes 29.5 ms and 210 MB.
 PyTorch's simulated rank takes 101 ms and 26.6 GB in BF16.
 The streamed loss holds the same 210 MB at 8, 72 or 144 GPUs.
 
