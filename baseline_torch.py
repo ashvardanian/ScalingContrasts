@@ -6,8 +6,8 @@
 
 Two ways to run it:
 
-    torchrun --nproc-per-node 8 baseline.py --pairs 1024 --prefixes 5 --impl bidir   # a real 8-GPU world
-    python baseline.py --pairs 1024 --prefixes 5 --simulate 72                        # one rank of a 72-GPU world
+    torchrun --nproc-per-node 8 baseline_torch.py --pairs 1024 --prefixes 5 --impl bidir   # a real 8-GPU world
+    python baseline_torch.py --pairs 1024 --prefixes 5 --simulate 72                        # one rank of a 72-GPU world
 
 The simulated world keeps what a rank of the real one keeps: open_clip's `_loss` per peer chunk, each
 chunk a distinct received copy of the text features, as the neighbour exchange's autograd saves them.

@@ -125,49 +125,97 @@ struct matryoshka_t {
     }
 };
 
-/** Adds this member's arrival to every replica's flag, waits on its own flag for the round's last
- *  arrival, and advances its own round, so the counters never reset. */
-static __global__ void multimem_barrier_kernel(std::uint32_t *multicast_flag, std::uint32_t *own_flag,
-                                               std::uint32_t *own_round, std::uint32_t members) {
-    std::uint32_t const target = *own_round + members;
-    asm volatile("multimem.red.release.sys.global.add.u32 [%0], %1;" ::"l"(multicast_flag), "r"(1u) : "memory");
-    std::uint32_t arrived = 0;
-    do asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(arrived) : "l"(own_flag) : "memory");
-    while (static_cast<std::int32_t>(arrived - target) < 0); // wrap-safe past 2³² arrivals
-    *own_round = target;
+/** One member's counters in the multimem domain: the multicast arrival flag, and its own replica's flag,
+ *  round and count of blocks done. */
+struct multimem_counters_t {
+    std::uint32_t *multicast_flag = nullptr, *own_flag = nullptr, *own_round = nullptr, *own_finished = nullptr;
+    std::uint32_t members = 0;
+};
+
+/** Adds one arrival for this member to every replica's flag. */
+__device__ inline void multimem_arrive_(multimem_counters_t const &counters) noexcept {
+    asm volatile("multimem.red.release.sys.global.add.u32 [%0], %1;" ::"l"(counters.multicast_flag), "r"(1u)
+                 : "memory");
 }
 
-/** @c own[i]=Σ(members)payload[i] over @b [begin,end), one switch-reduced load per four scalars. */
-static __global__ void multimem_reduce_scatter_kernel(nk::tensor_view<f32_t, 1> multicast,
+/** Waits until this member's own flag reaches @p target , wrap-safe past 2³² arrivals. */
+__device__ inline void multimem_await_(multimem_counters_t const &counters, std::uint32_t target) noexcept {
+    std::uint32_t arrived = 0;
+    do asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(arrived) : "l"(counters.own_flag) : "memory");
+    while (static_cast<std::int32_t>(arrived - target) < 0);
+}
+
+/** Enters a collective round: block 0 arrives for the member, every block waits for all members, and all of
+ *  them read the round before the last block to leave advances it. */
+[[nodiscard]] __device__ inline std::uint32_t multimem_enter_(multimem_counters_t const &counters) noexcept {
+    std::uint32_t const round = *counters.own_round;
+    if (threadIdx.x == 0 && blockIdx.x == 0) multimem_arrive_(counters);
+    if (threadIdx.x == 0) multimem_await_(counters, round + counters.members);
+    __syncthreads();
+    return round;
+}
+
+/** Leaves a collective round: the last block done arrives again, waits for every member's last block, and
+ *  advances the round, so the kernel ends only once no member still reads any payload. */
+__device__ inline void multimem_leave_(multimem_counters_t const &counters, std::uint32_t round) noexcept {
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    __threadfence_system();
+    if (atomicAdd(counters.own_finished, 1u) != gridDim.x - 1) return;
+    *counters.own_finished = 0;
+    multimem_arrive_(counters);
+    multimem_await_(counters, round + 2 * counters.members);
+    *counters.own_round = round + 2 * counters.members;
+}
+
+/** A barrier on its own: one arrival, then the round's last. */
+static __global__ void multimem_barrier_kernel(multimem_counters_t counters) {
+    std::uint32_t const round = *counters.own_round;
+    multimem_arrive_(counters);
+    multimem_await_(counters, round + counters.members);
+    *counters.own_round = round + counters.members;
+}
+
+/** @c own[i]=Σ(members)payload[i] over @b [begin,end), one switch-reduced load per four scalars,
+ *  between the round's entry and exit. */
+static __global__ void multimem_reduce_scatter_kernel(multimem_counters_t counters, nk::tensor_view<f32_t, 1> multicast,
                                                       nk::tensor_span<f32_t, 1> own, std::size_t begin,
                                                       std::size_t end) {
+    std::uint32_t const round = multimem_enter_(counters);
     for (std::size_t scalar = begin + 4 * (blockIdx.x * std::size_t {blockDim.x} + threadIdx.x); scalar < end;
          scalar += 4 * std::size_t {gridDim.x} * blockDim.x) {
         f32_t x, y, z, w;
-        asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.f32 {%0, %1, %2, %3}, [%4];"
+        asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.f32 " //
+                     "{%0, %1, %2, %3}, [%4];"                           //
                      : "=f"(x), "=f"(y), "=f"(z), "=f"(w)
                      : "l"(&multicast[scalar])
                      : "memory");
         asm volatile("st.global.v4.f32 [%0], {%1, %2, %3, %4};" ::"l"(&own[scalar]), "f"(x), "f"(y), "f"(z), "f"(w)
                      : "memory");
     }
+    multimem_leave_(counters, round);
 }
 
-/** @c payload[i]=Σ(members)payload[i] over @b [begin,end) on every replica: one switch-reduced load
- *  and one multicast store per four scalars. */
-static __global__ void multimem_all_reduce_kernel(nk::tensor_span<f32_t, 1> multicast, std::size_t begin,
-                                                  std::size_t end) {
+/** @c payload[i]=Σ(members)payload[i] over @b [begin,end) on every replica: one switch-reduced
+ *  load and one multicast store per four scalars, between the round's entry and exit. */
+static __global__ void multimem_all_reduce_kernel(multimem_counters_t counters, nk::tensor_span<f32_t, 1> multicast,
+                                                  std::size_t begin, std::size_t end) {
+    std::uint32_t const round = multimem_enter_(counters);
     for (std::size_t scalar = begin + 4 * (blockIdx.x * std::size_t {blockDim.x} + threadIdx.x); scalar < end;
          scalar += 4 * std::size_t {gridDim.x} * blockDim.x) {
         f32_t x, y, z, w;
-        asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.f32 {%0, %1, %2, %3}, [%4];"
+        asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.f32 " //
+                     "{%0, %1, %2, %3}, [%4];"                           //
                      : "=f"(x), "=f"(y), "=f"(z), "=f"(w)
                      : "l"(&multicast[scalar])
                      : "memory");
-        asm volatile("multimem.st.relaxed.sys.global.v4.f32 [%0], {%1, %2, %3, %4};" ::"l"(&multicast[scalar]), "f"(x),
-                     "f"(y), "f"(z), "f"(w)
+        asm volatile("multimem.st.relaxed.sys.global.v4.f32 " //
+                     "[%0], {%1, %2, %3, %4};"                //
+                     ::"l"(&multicast[scalar]),
+                     "f"(x), "f"(y), "f"(z), "f"(w)
                      : "memory");
     }
+    multimem_leave_(counters, round);
 }
 
 inline void require(CUresult result, char const *what) noexcept {
@@ -183,7 +231,8 @@ inline void require(CUresult result, char const *what) noexcept {
  *      multicast object that any of them addresses to reduce in the switch or to store into every
  *      replica at once.
  *
- *  A replica holds @ref payload_scalars scalars, then its arrival flag and its barrier round. Only
+ *  A replica holds @ref payload_scalars scalars, then its arrival flag, its barrier round and its
+ *  count of blocks done with a collective. Only
  *  its own GPU reads the round, so barriers advance with no host writes. Every call enqueues on
  *  @p member 's stream, with that member's device current.
  */
@@ -223,7 +272,7 @@ struct multimem_domain_t {
         CUmulticastObjectProp properties {};
         properties.numDevices = static_cast<unsigned>(members);
         properties.handleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-        // the payload, then the flag and the round
+        // the payload, then the flag, the round and the count of blocks done
         properties.size = (payload_scalars + 4) * sizeof(f32_t);
         std::size_t allocation_granularity = 0, multicast_granularity = 0;
         require(cuMemGetAllocationGranularity(&allocation_granularity, &allocation, CU_MEM_ALLOC_GRANULARITY_MINIMUM),
@@ -262,14 +311,13 @@ struct multimem_domain_t {
         require(cuDeviceGetAttribute(&domain.multiprocessors, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device_(0)),
                 "multiprocessor count");
         // A kernel's first launch loads it lazily, waiting for an idle device, so load the
-        // reductions while every device is idle rather than between barriers that spin.
+        // collectives while every device is idle rather than behind a member that spins.
         for (std::size_t member = 0; member != members; ++member) {
+            cudaFuncAttributes attributes {};
             require(cudaSetDevice(int(member)), "device switch");
-            launch(&multimem_reduce_scatter_kernel, 1, block_threads_k, nk::stream_t {}, domain.multicast_payload_(),
-                   domain.payload(member), std::size_t(0), std::size_t(0));
-            launch(&multimem_all_reduce_kernel, 1, block_threads_k, nk::stream_t {}, domain.multicast_payload_(),
-                   std::size_t(0), std::size_t(0));
-            require(cudaDeviceSynchronize(), "kernel loading");
+            require(cudaFuncGetAttributes(&attributes, &multimem_barrier_kernel), "kernel loading");
+            require(cudaFuncGetAttributes(&attributes, &multimem_reduce_scatter_kernel), "kernel loading");
+            require(cudaFuncGetAttributes(&attributes, &multimem_all_reduce_kernel), "kernel loading");
         }
         return domain;
     }
@@ -281,21 +329,15 @@ struct multimem_domain_t {
 
     /** Returns on @p member 's stream once every member has entered the same round. */
     void barrier(std::size_t member, nk::stream_t const &stream) noexcept {
-        CUdeviceptr const counters = replicas_base + member * stride + payload_scalars * sizeof(f32_t);
-        launch(&multimem_barrier_kernel, 1, 1, stream,
-               pointer_<std::uint32_t>(multicast_base + payload_scalars * sizeof(f32_t)),
-               pointer_<std::uint32_t>(counters), pointer_<std::uint32_t>(counters + sizeof(std::uint32_t)),
-               static_cast<std::uint32_t>(members));
+        launch(&multimem_barrier_kernel, 1, 1, stream, counters_(member));
     }
 
     /** In place: @p member 's slice of @p shard_scalars , a multiple of four, at
      *  @c member·shard_scalars of its payload becomes the sum of every payload's same slice. */
     void reduce_scatter(std::size_t member, std::size_t shard_scalars, nk::stream_t const &stream) noexcept {
         std::size_t const begin = member * shard_scalars, end = begin + shard_scalars;
-        barrier(member, stream);
-        launch(&multimem_reduce_scatter_kernel, blocks_(shard_scalars), block_threads_k, stream, multicast_payload_(),
-               payload(member), begin, end);
-        barrier(member, stream);
+        launch(&multimem_reduce_scatter_kernel, blocks_(shard_scalars), block_threads_k, stream, counters_(member),
+               multicast_payload_(), payload(member), begin, end);
     }
 
     /** In place: the first @p scalars , a multiple of four, of every payload become their sum, each
@@ -304,17 +346,25 @@ struct multimem_domain_t {
         std::size_t const vectors = scalars / 4, share = divide_round_up(vectors, members);
         std::size_t const begin = std::min(member * share, vectors) * 4,
                           end = std::min(member * share + share, vectors) * 4;
-        barrier(member, stream);
-        if (begin != end)
-            launch(&multimem_all_reduce_kernel, blocks_(end - begin), block_threads_k, stream, multicast_payload_(),
-                   begin, end);
-        barrier(member, stream);
+        launch(&multimem_all_reduce_kernel, blocks_(end - begin), block_threads_k, stream, counters_(member),
+               multicast_payload_(), begin, end);
     }
 
   private:
     template <typename value_type_>
     [[nodiscard]] static value_type_ *pointer_(CUdeviceptr address) noexcept {
         return reinterpret_cast<value_type_ *>(address);
+    }
+
+    [[nodiscard]] multimem_counters_t counters_(std::size_t member) const noexcept {
+        CUdeviceptr const own = replicas_base + member * stride + payload_scalars * sizeof(f32_t);
+        multimem_counters_t counters;
+        counters.multicast_flag = pointer_<std::uint32_t>(multicast_base + payload_scalars * sizeof(f32_t));
+        counters.own_flag = pointer_<std::uint32_t>(own);
+        counters.own_round = pointer_<std::uint32_t>(own + sizeof(std::uint32_t));
+        counters.own_finished = pointer_<std::uint32_t>(own + 2 * sizeof(std::uint32_t));
+        counters.members = static_cast<std::uint32_t>(members);
+        return counters;
     }
     [[nodiscard]] nk::tensor_span<f32_t, 1> multicast_payload_() const noexcept {
         return {pointer_<f32_t>(multicast_base), payload_scalars};
