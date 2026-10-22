@@ -40,35 +40,35 @@ The baselines, every one differentiating the same Matryoshka prefixes:
 - __open_clip bidir:__ open_clip 3.3.0's `SigLipLoss` under PyTorch 2.14.1, exchanging text chunks with both neighbours, as SigLIP trains in open_clip.
 - __open_clip gather:__ the same loss over all-gathered features.
 - __open_clip CLIP:__ the softmax InfoNCE `ClipLoss`, gathering with gradients.
-- __big_vision:__ big_vision's SigLIP `loss_fn` under JAX 0.12 and `jax.jit`, with the batch sharded over every GPU, so XLA gathers the text embeddings.
+- __big_vision:__ big_vision's SigLIP `loss_fn` under JAX 0.12 and `jax.jit`, with the batch sharded over every GPU, so XLA gathers the text embeddings, and with Float32 logits from the BF16 embeddings, as every other implementation here scores them.
 
 | 8 GPUs, step | Streamed | open_clip bidir | open_clip gather | open_clip CLIP | big_vision |
 | :----------- | -------: | --------------: | ---------------: | -------------: | ---------: |
-| R = 1024     |  2.06 ms |         26.4 ms |          22.8 ms |        11.0 ms |    3.18 ms |
-| R = 4096     |  7.17 ms |         27.3 ms |          26.1 ms |        83.0 ms |    5.51 ms |
-| R = 16384    |  82.1 ms |          142 ms |           153 ms | out of memory  |    72.8 ms |
+| R = 1024     |  2.06 ms |         26.4 ms |          22.8 ms |        11.0 ms |    3.27 ms |
+| R = 4096     |  7.17 ms |         27.3 ms |          26.1 ms |        83.0 ms |    8.18 ms |
+| R = 16384    |  82.1 ms |          142 ms |           153 ms | out of memory  |     106 ms |
 
 | 8 GPUs, memory | Streamed | open_clip bidir | open_clip gather | open_clip CLIP | big_vision |
 | :------------- | -------: | --------------: | ---------------: | -------------: | ---------: |
-| R = 1024       |    19 MB |          241 MB |           270 MB |        1.71 GB |     443 MB |
-| R = 4096       |   206 MB |         3.03 GB |          3.40 GB |        26.2 GB |    5.28 GB |
-| R = 16384      |  2.89 GB |         45.1 GB |          50.6 GB | out of memory  |    48.2 GB |
+| R = 1024       |    19 MB |          241 MB |           270 MB |        1.71 GB |     484 MB |
+| R = 4096       |   206 MB |         3.03 GB |          3.40 GB |        26.2 GB |    6.19 GB |
+| R = 16384      |  2.89 GB |         45.1 GB |          50.6 GB | out of memory  |    60.8 GB |
 
 Across two such boxes, one process per box and eight 100 Gb/s RoCE rails between them:
 
 | 16 GPUs, step | Streamed | open_clip bidir | open_clip gather | open_clip CLIP | big_vision |
 | :------------ | -------: | --------------: | ---------------: | -------------: | ---------: |
-| R = 1024      |  4.49 ms |         45.7 ms |          39.3 ms |        25.4 ms |    3.72 ms |
-| R = 4096      |  14.6 ms |         49.4 ms |          42.0 ms |         333 ms |    12.7 ms |
-| R = 16384     |   164 ms |          362 ms |           305 ms | out of memory  |     152 ms |
+| R = 1024      |  4.49 ms |         45.7 ms |          39.3 ms |        25.4 ms |    4.57 ms |
+| R = 4096      |  14.6 ms |         49.4 ms |          42.0 ms |         333 ms |    20.9 ms |
+| R = 16384     |   164 ms |          362 ms |           305 ms | out of memory  |     223 ms |
 
 | 16 GPUs, memory | Streamed | open_clip bidir | open_clip gather | open_clip CLIP | big_vision |
 | :-------------- | -------: | --------------: | ---------------: | -------------: | ---------: |
-| R = 1024        |    23 MB |          474 MB |           503 MB |        6.64 GB |     881 MB |
-| R = 4096        |   223 MB |         5.97 GB |          6.34 GB |         104 GB |    12.7 GB |
-| R = 16384       |  2.95 GB |         89.1 GB |          94.6 GB | out of memory  |    96.2 GB |
+| R = 1024        |    23 MB |          474 MB |           503 MB |        6.64 GB |     883 MB |
+| R = 4096        |   223 MB |         5.97 GB |          6.34 GB |         104 GB |    11.1 GB |
+| R = 16384       |  2.95 GB |         89.1 GB |          94.6 GB | out of memory  |     105 GB |
 
-big_vision is the fastest at every size: XLA turns each device's whole loss into one large product and fuses the rest, at 11 to 49 times the streamed loss's memory.
+The streamed loss is the fastest at every size, holding 21 to 50 times less memory than big_vision, the fastest baseline, whose XLA program turns each device's whole loss into one large product.
 open_clip's CLIP loss runs out of 268 GB at R = 16384, where its logits and their softmax grow with the world.
 
 Each GPU scores its host's eight towers while the other host's eight are in flight, then scores those once they land.

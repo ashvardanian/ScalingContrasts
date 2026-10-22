@@ -7,7 +7,8 @@
 big_vision computes the loss under `jax.jit` on a batch sharded across devices, so XLA gathers the
 text embeddings and builds each device's logits against the whole world. The loss function below is
 its `loss_fn` from `big_vision/trainers/proj/image_text/siglip.py`, applied to every Matryoshka
-prefix of the embeddings. Run one process per host:
+prefix of the embeddings, with BF16 embeddings and Float32 logits, as `scalingcontrasts` scores them.
+Run one process per host:
 
     python baseline_jax.py --pairs 1024 --prefixes 5                                     # every local GPU
     python baseline_jax.py --pairs 1024 --prefixes 5 --coordinator HOST:PORT --hosts 2 --host 0
@@ -30,7 +31,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 def big_vision_loss(zimg, ztxt, t, b):
     """big_vision's SigLIP loss: every positive on the diagonal, every other pair a negative."""
-    logits = jnp.dot(zimg, ztxt.T)
+    logits = jnp.dot(zimg, ztxt.T, preferred_element_type=jnp.float32)
     logits = logits * t + b
     eye = jnp.eye(zimg.shape[0])
     m1_diag1 = -jnp.ones_like(logits) + 2 * eye
