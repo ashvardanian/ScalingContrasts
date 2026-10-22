@@ -674,11 +674,15 @@ static __global__ void prefix_norms_kernel(nk::tensor_view<bf16_t, 2> vertices, 
 
 inline constexpr std::uint32_t fused_side_k = 128; // tile rows and columns, the MMA's M and N
 inline constexpr std::uint32_t fused_depth_k = 64; // channels per stage, one 128-byte swizzle row
-inline constexpr std::uint32_t fused_ring_k = 3;   // stages in flight, two blocks per SM
+inline constexpr std::uint32_t fused_ring_k = 4;   // stages in flight, one block per SM
 inline constexpr std::uint32_t fused_chunk_k = 32; // columns one `tcgen05.ld` moves per lane
 inline constexpr std::uint32_t fused_stage_bytes_k = fused_side_k * fused_depth_k * sizeof(bf16_t);
 inline constexpr std::uint32_t fused_shared_bytes_k = 2 * fused_ring_k * fused_stage_bytes_k + 1024; // + alignment
-inline constexpr std::uint32_t fused_threads_k = 160; // four epilogue warps, the first issuing MMAs, and a TMA warp
+inline constexpr std::uint32_t fused_epilogue_warps_k = 8;      // two per TMEM lane quarter
+inline constexpr std::uint32_t fused_first_epilogue_warp_k = 2; // after the TMA and MMA warps
+inline constexpr std::uint32_t fused_threads_k = (fused_first_epilogue_warp_k + fused_epilogue_warps_k) * 32;
+inline constexpr std::uint32_t fused_halves_chunks_k = fused_side_k / fused_chunk_k / 2; // chunks per column half
+inline constexpr std::uint32_t fused_tmem_columns_k = 4 * fused_side_k; // raw dots, suffix and two segments
 
 /** The instruction descriptor of a @b [128,128] BF16 MMA into Float32, both operands K-major. */
 inline constexpr std::uint32_t fused_instruction_k = (1u << 4)                                 // Float32 accumulator
@@ -702,6 +706,10 @@ struct fused_tile_t {
 
 __device__ inline void mbarrier_init_(std::uint64_t &barrier, std::uint32_t arrivals) noexcept {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(shared_address_(&barrier)), "r"(arrivals) : "memory");
+}
+
+__device__ inline void mbarrier_arrive_(std::uint64_t &barrier) noexcept {
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(shared_address_(&barrier)) : "memory");
 }
 
 __device__ inline void mbarrier_wait_(std::uint64_t &barrier, std::uint32_t parity) noexcept {
@@ -815,19 +823,28 @@ struct fused_row_t {
     f32_t loss = 0, bias_grad = 0, log_beta_grad = 0;
 };
 
-/** Scores @p band for this lane's row from the raw dots in TMEM at @p dots , adds its gradient to
- *  the suffix in TMEM at @p suffix , and writes that suffix as the band's BF16 gradient row, with
- *  the row's coefficient. */
-__device__ inline void score_fused_row_(fused_tile_t const &tile, std::uint32_t dots, std::uint32_t suffix,
-                                        std::uint32_t band, bool first, fused_row_t &summands) noexcept {
-    std::uint32_t const local_row = threadIdx.x;
+/** Scores @p band for this lane's row over half @p half of the tile's columns: unless @p first ,
+ *  folds the segment in TMEM at @p segment into the raw dots at @p raw , adds the band's gradient
+ *  to the suffix at @p suffix , and writes that suffix as the band's BF16 gradient, with the row's
+ *  coefficient partial. */
+__device__ inline void score_fused_row_(fused_tile_t const &tile, std::uint32_t raw, std::uint32_t suffix,
+                                        std::uint32_t segment, std::uint32_t band, bool first, std::uint32_t half,
+                                        fused_row_t &summands) noexcept {
+    std::uint32_t const local_row = threadIdx.x % 128;
     std::size_t const row = std::size_t {blockIdx.y} * fused_side_k + local_row;
     f32_t const row_norm = tile.row_norms[band, row];
     f32_t coefficient = 0;
-    for (std::uint32_t chunk = 0; chunk != fused_side_k / fused_chunk_k; ++chunk) {
-        f32_t raw[fused_chunk_k], running[fused_chunk_k] = {};
-        tmem_load_(dots + chunk * fused_chunk_k, raw);
-        if (!first) tmem_load_(suffix + chunk * fused_chunk_k, running);
+    for (std::uint32_t chunk = half * fused_halves_chunks_k; chunk != (half + 1) * fused_halves_chunks_k; ++chunk) {
+        f32_t dots[fused_chunk_k], running[fused_chunk_k] = {};
+        tmem_load_(raw + chunk * fused_chunk_k, dots);
+        if (!first) {
+            f32_t swept[fused_chunk_k];
+            tmem_load_(segment + chunk * fused_chunk_k, swept);
+#pragma unroll
+            for (std::uint32_t cell = 0; cell != fused_chunk_k; ++cell) dots[cell] += swept[cell];
+            tmem_store_(raw + chunk * fused_chunk_k, dots);
+            tmem_load_(suffix + chunk * fused_chunk_k, running);
+        }
         std::size_t const first_column = std::size_t {blockIdx.x} * fused_side_k + chunk * fused_chunk_k;
         std::uint32_t packed[fused_chunk_k / 2];
 #pragma unroll
@@ -835,7 +852,7 @@ __device__ inline void score_fused_row_(fused_tile_t const &tile, std::uint32_t 
             std::size_t const column = first_column + cell;
             bool const own_copy = tile.row_base + row == tile.column_base + column;
             f32_t const denominator = row_norm * tile.column_norms[band, column];
-            f32_t const cosine = denominator > cosine_floor_k ? __fdividef(raw[cell], denominator) : 0.0f;
+            f32_t const cosine = denominator > cosine_floor_k ? __fdividef(dots[cell], denominator) : 0.0f;
             // A vertex's cosine with its own copy is one, whatever its raw dot rounds to.
             f32_t const logit = tile.beta * (own_copy ? 1.0f : cosine);
             f32_t const target = own_copy ? 1.0f : -1.0f;
@@ -850,7 +867,7 @@ __device__ inline void score_fused_row_(fused_tile_t const &tile, std::uint32_t 
             f32_t const raw_grad = own_copy
                                        ? 0.0f
                                        : __fdividef(2.0f * tile.beta * cell_grad, fmaxf(denominator, cosine_floor_k));
-            coefficient += raw_grad * raw[cell];
+            coefficient += raw_grad * dots[cell];
             running[cell] += raw_grad;
             if (cell % 2)
                 packed[cell / 2] = __bfloat16_as_ushort(__float2bfloat16(running[cell - 1])) |
@@ -864,7 +881,7 @@ __device__ inline void score_fused_row_(fused_tile_t const &tile, std::uint32_t 
                 "r"(packed[quarter * 4 + 3])
                 : "memory");
     }
-    tile.partials[3 + band, row, blockIdx.x] = coefficient;
+    tile.partials[3 + band, row, blockIdx.x * 2 + half] = coefficient;
 }
 
 /**
@@ -872,18 +889,18 @@ __device__ inline void score_fused_row_(fused_tile_t const &tile, std::uint32_t 
  *      MMAs fed by TMA, with no Float32 @b [K,R,R] stash.
  *
  *  A forward sweep over the depth accumulates every cell's full raw dot in TMEM. A reverse sweep
- *  with negated rows then takes the suffix back off, meeting the band edges widest first, and at
- *  each edge the four epilogue warps score their rows, keeping each band's suffix-summed gradient
- *  in TMEM beside the dots. Row summands land in the tile's @b [3+K,R,R/128] partials, which
- *  @ref fold_partials_kernel adds in order. The fifth warp only streams stages through a ring of
- *  @c fused_ring_k slots.
+ *  with negated rows then takes the suffix back off one segment between band edges at a time, each
+ *  into the other of two TMEM segment buffers, so the MMA warp sweeps the next segment while eight
+ *  epilogue warps fold the last one into the raw dots and score its band. Each band's
+ *  suffix-summed gradient stays in TMEM beside the dots. Row summands land in the tile's
+ *  @b [3+K,R,R/64] partials, which @ref fold_partials_kernel adds in order.
  */
-static __global__ void __launch_bounds__(fused_threads_k)
+static __global__ void __launch_bounds__(fused_threads_k, 1)
     matryoshka_tile_kernel(CUtensorMap const __grid_constant__ rows_map,
                            CUtensorMap const __grid_constant__ columns_map, std::uint32_t stages,
                            fused_tile_t const tile, matryoshka_t ladder) {
     extern __shared__ byte_t dynamic_shared[];
-    __shared__ alignas(8) std::uint64_t filled[fused_ring_k], emptied[fused_ring_k], scored;
+    __shared__ alignas(8) std::uint64_t filled[fused_ring_k], emptied[fused_ring_k], totalled, swept[2], drained[2];
     __shared__ std::uint32_t tmem_base;
     byte_t *const ring = dynamic_shared + (1024 - shared_address_(dynamic_shared) % 1024) % 1024;
     std::uint32_t const warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -899,13 +916,15 @@ static __global__ void __launch_bounds__(fused_threads_k)
     if (threadIdx.x == 0) {
         for (std::uint32_t slot = 0; slot != fused_ring_k; ++slot)
             mbarrier_init_(filled[slot], 1), mbarrier_init_(emptied[slot], 1);
-        mbarrier_init_(scored, 1);
+        mbarrier_init_(totalled, 1);
+        for (std::uint32_t buffer = 0; buffer != 2; ++buffer)
+            mbarrier_init_(swept[buffer], 1), mbarrier_init_(drained[buffer], fused_epilogue_warps_k);
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
-    if (warp == 0) {
+    if (warp == fused_first_epilogue_warp_k) {
         asm volatile(
             "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" ::"r"(shared_address_(&tmem_base)),
-            "r"(2 * fused_side_k)
+            "r"(fused_tmem_columns_k)
             : "memory");
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
     }
@@ -913,7 +932,9 @@ static __global__ void __launch_bounds__(fused_threads_k)
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    if (warp == 4) {
+    // The raw dots, the gradient suffix and the two segment buffers take 128 TMEM columns each.
+    std::uint32_t const raw = tmem_base, suffix = raw + fused_side_k, segments = raw + 2 * fused_side_k;
+    if (warp == 0) {
         if (lane != 0) return;
         for (std::uint32_t position = 0; position != positions; ++position) {
             std::uint32_t const slot = position % fused_ring_k;
@@ -924,54 +945,68 @@ static __global__ void __launch_bounds__(fused_threads_k)
         }
         return;
     }
-
-    // Each epilogue warp owns 32 TMEM lanes, one per row; dots and suffix take 128 columns each.
-    std::uint32_t const dots = tmem_base + (warp * 32 << 16), suffix = dots + fused_side_k;
-    bool const issuer = threadIdx.x == 0;
-    std::uint32_t band = ladder.count - 1, epilogues = 0;
-    fused_row_t summands;
-    auto const score = [&](std::uint32_t scored_band) {
-        if (issuer) tcgen05_commit_(scored);
-        mbarrier_wait_(scored, epilogues++ % 2);
-        __syncwarp();
-        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-        score_fused_row_(tile, dots, suffix, scored_band, scored_band + 1 == ladder.count, summands);
-        asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
-        asm volatile("bar.sync 1, 128;" ::: "memory");
-        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-    };
-    for (std::uint32_t position = 0; position != positions; ++position) {
-        std::uint32_t const slot = position % fused_ring_k, depth = depth_of(position);
-        bool const reverse = position >= stages;
-        if (issuer) {
+    if (warp == 1) {
+        if (lane != 0) return;
+        std::uint32_t band = ladder.count - 1, segment = 0;
+        bool fresh = true; // the next MMA overwrites its accumulator
+        for (std::uint32_t position = 0; position != positions; ++position) {
+            std::uint32_t const slot = position % fused_ring_k, depth = depth_of(position);
+            bool const reverse = position >= stages;
+            std::uint32_t const accumulator = reverse ? segments + segment % 2 * fused_side_k : raw;
             mbarrier_wait_(filled[slot], position / fused_ring_k % 2);
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-        }
-        for (std::uint32_t order = 0; order != fused_depth_k / 16; ++order) {
-            std::uint32_t const step = reverse ? fused_depth_k / 16 - 1 - order : order;
-            if (issuer)
-                tcgen05_mma_(dots & 0xFFFFu, stage_descriptor_(rows_stage(slot), step),
+            for (std::uint32_t order = 0; order != fused_depth_k / 16; ++order) {
+                std::uint32_t const step = reverse ? fused_depth_k / 16 - 1 - order : order;
+                tcgen05_mma_(accumulator & 0xFFFFu, stage_descriptor_(rows_stage(slot), step),
                              stage_descriptor_(columns_stage(slot), step),
-                             reverse ? fused_negated_instruction_k : fused_instruction_k, position | step);
-            if (reverse && band && depth + step * 16 == ladder.ends[band - 1]) score(--band);
+                             reverse ? fused_negated_instruction_k : fused_instruction_k, !fresh);
+                fresh = false;
+            }
+            tcgen05_commit_(emptied[slot]);
+            if (position + 1 == stages) tcgen05_commit_(totalled), fresh = true;
+            else if (reverse && band && depth == ladder.ends[band - 1]) {
+                tcgen05_commit_(swept[segment % 2]);
+                --band, ++segment, fresh = true;
+                // A segment buffer refills only once every epilogue warp folded what it held.
+                if (band && segment >= 2) mbarrier_wait_(drained[segment % 2], (segment / 2 - 1) % 2);
+            }
         }
-        if (issuer) tcgen05_commit_(emptied[slot]);
-        if (position + 1 == stages) score(band);
+        return;
     }
 
-    std::size_t const row = std::size_t {blockIdx.y} * fused_side_k + threadIdx.x;
-    tile.partials[0, row, blockIdx.x] = summands.loss;
-    tile.partials[1, row, blockIdx.x] = summands.bias_grad;
-    tile.partials[2, row, blockIdx.x] = summands.log_beta_grad;
+    // Two epilogue warps share each 32-lane TMEM quarter, one per half of the tile's columns.
+    std::uint32_t const quarter = warp % 4, half = (warp - fused_first_epilogue_warp_k) / 4;
+    std::uint32_t const lanes = quarter * 32 << 16;
+    fused_row_t summands;
+    mbarrier_wait_(totalled, 0);
+    __syncwarp();
+    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+    score_fused_row_(tile, raw + lanes, suffix + lanes, 0, ladder.count - 1, true, half, summands);
+    for (std::uint32_t segment = 0; segment + 1 < ladder.count; ++segment) {
+        mbarrier_wait_(swept[segment % 2], segment / 2 % 2);
+        __syncwarp();
+        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+        score_fused_row_(tile, raw + lanes, suffix + lanes, segments + segment % 2 * fused_side_k + lanes,
+                         ladder.count - 2 - segment, false, half, summands);
+        asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+        __syncwarp();
+        if (lane == 0) mbarrier_arrive_(drained[segment % 2]);
+    }
+
+    std::size_t const row = std::size_t {blockIdx.y} * fused_side_k + quarter * 32 + lane;
+    tile.partials[0, row, blockIdx.x * 2 + half] = summands.loss;
+    tile.partials[1, row, blockIdx.x * 2 + half] = summands.bias_grad;
+    tile.partials[2, row, blockIdx.x * 2 + half] = summands.log_beta_grad;
     asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
-    asm volatile("bar.sync 1, 128;" ::: "memory");
-    if (warp == 0)
-        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" ::"r"(tmem_base), "r"(2 * fused_side_k)
+    asm volatile("bar.sync 1, %0;" ::"n"(fused_epilogue_warps_k * 32) : "memory");
+    if (warp == fused_first_epilogue_warp_k)
+        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" ::"r"(tmem_base), "r"(fused_tmem_columns_k)
                      : "memory");
 }
 
 inline constexpr std::uint32_t backward_channels_k = 64; // forces per tile, so every tile lies in one band
 inline constexpr std::uint32_t backward_ring_k = 4;
+inline constexpr std::uint32_t backward_threads_k = 160; // four epilogue warps, the first issuing MMAs, and a TMA warp
 inline constexpr std::uint32_t backward_rows_bytes_k = fused_side_k * fused_depth_k * sizeof(bf16_t);
 inline constexpr std::uint32_t backward_columns_bytes_k = backward_channels_k * fused_depth_k * sizeof(bf16_t);
 inline constexpr std::uint32_t backward_shared_bytes_k =
@@ -989,7 +1024,7 @@ inline constexpr std::uint32_t backward_instruction_k = (1u << 4)               
  *  @c backward_ring_k stages, one thread issues @c tcgen05 MMAs into tensor memory, and once they
  *  finish each of four warps adds its 32 rows into the Float32 forces.
  */
-static __global__ void __launch_bounds__(fused_threads_k)
+static __global__ void __launch_bounds__(backward_threads_k)
     backward_tile_kernel(CUtensorMap const __grid_constant__ gradient_map,
                          CUtensorMap const __grid_constant__ transposed_map, std::uint32_t stages,
                          nk::tensor_span<f32_t, 2> forces, matryoshka_t ladder) {
@@ -1151,7 +1186,7 @@ struct streamed_loss_t {
         loss.forces = make_tensor<f32_t, 2>(loss.capabilities, stream, {rows, hidden});
         loss.scalars = make_tensor<f32_t, 2>(loss.capabilities, stream, {3, rows});
         loss.self_coefficients = make_tensor<f32_t, 2>(loss.capabilities, stream, {k, rows});
-        loss.partials = make_tensor<f32_t, 3>(loss.capabilities, stream, {3 + k, rows, rows / fused_side_k});
+        loss.partials = make_tensor<f32_t, 3>(loss.capabilities, stream, {3 + k, rows, 2 * rows / fused_side_k});
         loss.gradient = make_tensor<bf16_t, 3>(loss.capabilities, stream, {k, rows, rows});
         loss.transposed = make_tensor<bf16_t, 2>(loss.capabilities, stream, {hidden, rows});
         loss.staged = make_tensor<bf16_t, 2>(loss.capabilities, stream, {rows, hidden});
@@ -1197,7 +1232,7 @@ struct streamed_loss_t {
         launch(&fold_partials_kernel, divide_round_up(rows, block_threads_k), block_threads_k, stream, partials.view(),
                scalars.span(), self_coefficients.span());
         launch(&backward_tile_kernel, dim3 {static_cast<std::uint32_t>(hidden / backward_channels_k), tiles},
-               fused_threads_k, backward_shared_bytes_k, stream,
+               backward_threads_k, backward_shared_bytes_k, stream,
                tensor_map_<3>(gradient.data(), {rows, rows, ladder.count}, {fused_depth_k, fused_side_k, 1}),
                tensor_map_<2>(transposed.data(), {rows, hidden}, {fused_depth_k, backward_channels_k}),
                static_cast<std::uint32_t>(rows / fused_depth_k), forces.span(), ladder);
