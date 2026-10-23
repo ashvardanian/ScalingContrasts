@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.28)
-project(scalingcontrasts LANGUAGES CXX CUDA)
+project(
+    scalingcontrasts
+    DESCRIPTION "NVLink and RDMA primitives for scaled-up contrastive learning"
+    LANGUAGES CXX CUDA
+)
 
 # B300 only: `tcgen05` and TMA need the architecture-specific Blackwell Ultra target.
 set(SCALINGCONTRASTS_CUDA_ARCHITECTURES "103a-real" CACHE STRING "GPU code to compile, as SASS")

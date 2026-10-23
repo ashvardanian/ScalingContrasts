@@ -184,7 +184,7 @@ __device__ inline void multimem_leave_(multimem_counters_t const &counters, std:
 }
 
 /** A barrier on its own: one arrival, then the round's last. */
-static __global__ void multimem_barrier_kernel(multimem_counters_t counters) {
+static __global__ void multimem_barrier_cuda_(multimem_counters_t counters) {
     std::uint32_t const round = *counters.own_round;
     multimem_arrive_(counters);
     multimem_await_(counters, round + counters.members);
@@ -193,9 +193,9 @@ static __global__ void multimem_barrier_kernel(multimem_counters_t counters) {
 
 /** @c own[i]=Σ(members)payload[i] over @b [begin,end), one switch-reduced load per four scalars,
  *  between the round's entry and exit. */
-static __global__ void multimem_reduce_scatter_kernel(multimem_counters_t counters, nk::tensor_view<f32_t, 1> multicast,
-                                                      nk::tensor_span<f32_t, 1> own, std::size_t begin,
-                                                      std::size_t end) {
+static __global__ void multimem_reduce_scatter_cuda_(multimem_counters_t counters, nk::tensor_view<f32_t, 1> multicast,
+                                                     nk::tensor_span<f32_t, 1> own, std::size_t begin,
+                                                     std::size_t end) {
     std::uint32_t const round = multimem_enter_(counters);
     for (std::size_t scalar = begin + 4 * (blockIdx.x * std::size_t {blockDim.x} + threadIdx.x); scalar < end;
          scalar += 4 * std::size_t {gridDim.x} * blockDim.x) {
@@ -213,8 +213,8 @@ static __global__ void multimem_reduce_scatter_kernel(multimem_counters_t counte
 
 /** @c payload[i]=Σ(members)payload[i] over @b [begin,end) on every replica: one switch-reduced
  *  load and one multicast store per four scalars, between the round's entry and exit. */
-static __global__ void multimem_all_reduce_kernel(multimem_counters_t counters, nk::tensor_span<f32_t, 1> multicast,
-                                                  std::size_t begin, std::size_t end) {
+static __global__ void multimem_all_reduce_cuda_(multimem_counters_t counters, nk::tensor_span<f32_t, 1> multicast,
+                                                 std::size_t begin, std::size_t end) {
     std::uint32_t const round = multimem_enter_(counters);
     for (std::size_t scalar = begin + 4 * (blockIdx.x * std::size_t {blockDim.x} + threadIdx.x); scalar < end;
          scalar += 4 * std::size_t {gridDim.x} * blockDim.x) {
@@ -337,9 +337,9 @@ struct multimem_domain_t {
         for (std::size_t member = 0; member != members; ++member) {
             cudaFuncAttributes attributes {};
             require(cudaSetDevice(int(member)), "device switch");
-            require(cudaFuncGetAttributes(&attributes, &multimem_barrier_kernel), "kernel loading");
-            require(cudaFuncGetAttributes(&attributes, &multimem_reduce_scatter_kernel), "kernel loading");
-            require(cudaFuncGetAttributes(&attributes, &multimem_all_reduce_kernel), "kernel loading");
+            require(cudaFuncGetAttributes(&attributes, &multimem_barrier_cuda_), "kernel loading");
+            require(cudaFuncGetAttributes(&attributes, &multimem_reduce_scatter_cuda_), "kernel loading");
+            require(cudaFuncGetAttributes(&attributes, &multimem_all_reduce_cuda_), "kernel loading");
         }
         return domain;
     }
@@ -351,14 +351,14 @@ struct multimem_domain_t {
 
     /** Returns on @p member 's stream once every member has entered the same round. */
     void barrier(std::size_t member, nk::stream_t const &stream) noexcept {
-        launch(&multimem_barrier_kernel, 1, 1, stream, counters_(member));
+        launch(&multimem_barrier_cuda_, 1, 1, stream, counters_(member));
     }
 
     /** In place: @p member 's slice of @p shard_scalars , a multiple of four, at
      *  @c member·shard_scalars of its payload becomes the sum of every payload's same slice. */
     void reduce_scatter(std::size_t member, std::size_t shard_scalars, nk::stream_t const &stream) noexcept {
         std::size_t const begin = member * shard_scalars, end = begin + shard_scalars;
-        launch(&multimem_reduce_scatter_kernel, blocks_(shard_scalars), block_threads_k, stream, counters_(member),
+        launch(&multimem_reduce_scatter_cuda_, blocks_(shard_scalars), block_threads_k, stream, counters_(member),
                multicast_payload_(), payload(member), begin, end);
     }
 
@@ -368,7 +368,7 @@ struct multimem_domain_t {
         std::size_t const vectors = scalars / 4, share = divide_round_up(vectors, members);
         std::size_t const begin = std::min(member * share, vectors) * 4,
                           end = std::min(member * share + share, vectors) * 4;
-        launch(&multimem_all_reduce_kernel, blocks_(end - begin), block_threads_k, stream, counters_(member),
+        launch(&multimem_all_reduce_cuda_, blocks_(end - begin), block_threads_k, stream, counters_(member),
                multicast_payload_(), begin, end);
     }
 
@@ -657,7 +657,7 @@ struct rdma_rail_t {
     return value;
 }
 
-static __global__ void transpose_kernel(nk::tensor_view<bf16_t, 2> source, nk::tensor_span<bf16_t, 2> destination) {
+static __global__ void transpose_cuda_(nk::tensor_view<bf16_t, 2> source, nk::tensor_span<bf16_t, 2> destination) {
     __shared__ bf16_t tile[32][33];
     std::size_t const candidate_base = blockIdx.x * 32, query_base = blockIdx.y * 32;
     for (std::uint32_t step = threadIdx.y; step < 32; step += blockDim.y)
@@ -669,8 +669,8 @@ static __global__ void transpose_kernel(nk::tensor_view<bf16_t, 2> source, nk::t
             destination[candidate_base + step, query_base + threadIdx.x] = tile[threadIdx.x][step];
 }
 
-static __global__ void prefix_inverse_norms_kernel(nk::tensor_view<bf16_t, 2> embeddings,
-                                                   nk::tensor_span<f32_t, 2> norms, matryoshka_t ladder) {
+static __global__ void prefix_inverse_norms_cuda_(nk::tensor_view<bf16_t, 2> embeddings,
+                                                  nk::tensor_span<f32_t, 2> norms, matryoshka_t ladder) {
     std::size_t const row = blockIdx.x;
     f32_t running = 0.0f;
     for (std::uint32_t band = 0; band != ladder.count; ++band) {
@@ -930,11 +930,11 @@ struct forward_segment_t {
  *  into the other of two TMEM segment buffers, so the MMA warp sweeps the next segment while eight
  *  epilogue warps fold the last one into the raw dots and score its band. Each band's
  *  suffix-summed gradient stays in TMEM beside the dots. Row summands land in the tile's
- *  @b [3+K,R/64,R] partials, which @ref fold_partials_kernel adds in order.
+ *  @b [3+K,R/64,R] partials, which @ref fold_partials_cuda_ adds in order.
  */
 static __global__ void __launch_bounds__(forward_threads_k, 1)
-    forward_tile_kernel(CUtensorMap const __grid_constant__ rows_map, CUtensorMap const __grid_constant__ columns_map,
-                        forward_tile_t const tile, matryoshka_t ladder) {
+    forward_tile_cuda_(CUtensorMap const __grid_constant__ rows_map, CUtensorMap const __grid_constant__ columns_map,
+                       forward_tile_t const tile, matryoshka_t ladder) {
     extern __shared__ byte_t dynamic_shared[];
     __shared__ alignas(8) std::uint64_t filled[forward_ring_k], emptied[forward_ring_k], swept[2], drained[2];
     __shared__ std::uint32_t tmem_base;
@@ -1059,9 +1059,9 @@ inline constexpr std::uint32_t backward_instruction_k = (1u << 4)               
  *  finish each of four warps adds its 32 rows into the Float32 query gradient.
  */
 static __global__ void __launch_bounds__(backward_threads_k)
-    backward_tile_kernel(CUtensorMap const __grid_constant__ gradient_map,
-                         CUtensorMap const __grid_constant__ candidates_map, std::uint32_t stages,
-                         nk::tensor_span<f32_t, 2> query_gradient, matryoshka_t ladder) {
+    backward_tile_cuda_(CUtensorMap const __grid_constant__ gradient_map,
+                        CUtensorMap const __grid_constant__ candidates_map, std::uint32_t stages,
+                        nk::tensor_span<f32_t, 2> query_gradient, matryoshka_t ladder) {
     extern __shared__ byte_t dynamic_shared[];
     __shared__ alignas(8) std::uint64_t filled[backward_ring_k], emptied[backward_ring_k], finished;
     __shared__ std::uint32_t tmem_base;
@@ -1135,9 +1135,9 @@ static __global__ void __launch_bounds__(backward_threads_k)
 
 /** Adds each row's column-tile @p row_partials , in tile order, to its @p summand_rows and
  *  @p self_coefficients . */
-static __global__ void fold_partials_kernel(nk::tensor_view<f32_t, 3> row_partials,
-                                            nk::tensor_span<f32_t, 2> summand_rows,
-                                            nk::tensor_span<f32_t, 2> self_coefficients) {
+static __global__ void fold_partials_cuda_(nk::tensor_view<f32_t, 3> row_partials,
+                                           nk::tensor_span<f32_t, 2> summand_rows,
+                                           nk::tensor_span<f32_t, 2> self_coefficients) {
     std::size_t const row = blockIdx.x * std::size_t {blockDim.x} + threadIdx.x;
     if (row >= row_partials.extent(2)) return;
     for (std::size_t quantity = 0; quantity != row_partials.extent(0); ++quantity) {
@@ -1149,10 +1149,10 @@ static __global__ void fold_partials_kernel(nk::tensor_view<f32_t, 3> row_partia
 }
 
 /** The cosine's self term folded into the query gradient, then its BF16 copy. */
-static __global__ void finalize_kernel(nk::tensor_view<bf16_t, 2> queries, nk::tensor_view<f32_t, 2> inverse_norms,
-                                       nk::tensor_view<f32_t, 2> self_coefficients,
-                                       nk::tensor_view<f32_t, 2> query_gradient,
-                                       nk::tensor_span<bf16_t, 2> gradient_out, matryoshka_t ladder) {
+static __global__ void finalize_cuda_(nk::tensor_view<bf16_t, 2> queries, nk::tensor_view<f32_t, 2> inverse_norms,
+                                      nk::tensor_view<f32_t, 2> self_coefficients,
+                                      nk::tensor_view<f32_t, 2> query_gradient, nk::tensor_span<bf16_t, 2> gradient_out,
+                                      matryoshka_t ladder) {
     std::size_t const row = blockIdx.x;
     for (std::uint32_t channel = threadIdx.x; channel < queries.extent(1); channel += blockDim.x) {
         f32_t fold = 0.0f;
@@ -1165,7 +1165,7 @@ static __global__ void finalize_kernel(nk::tensor_view<bf16_t, 2> queries, nk::t
     }
 }
 
-static __global__ void sum_summands_kernel(nk::tensor_view<f32_t, 2> summand_rows, nk::tensor_span<f32_t, 1> summands) {
+static __global__ void sum_summands_cuda_(nk::tensor_view<f32_t, 2> summand_rows, nk::tensor_span<f32_t, 1> summands) {
     for (std::uint32_t which = 0; which != 3; ++which) {
         f32_t partial = 0.0f;
         for (std::size_t row = threadIdx.x; row < summand_rows.extent(1); row += blockDim.x)
@@ -1216,10 +1216,10 @@ struct streamed_loss_t {
                     ? 0
                     : EINVAL,
                 "tile shape, which takes rows in multiples of 128, and channels and band edges in 64");
-        require(cudaFuncSetAttribute(&forward_tile_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        require(cudaFuncSetAttribute(&forward_tile_cuda_, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                      int(forward_shared_bytes_k)),
                 "forward tile shared memory");
-        require(cudaFuncSetAttribute(&backward_tile_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        require(cudaFuncSetAttribute(&backward_tile_cuda_, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                      int(backward_shared_bytes_k)),
                 "backward tile shared memory");
         loss.query_inverse_norms = make_tensor<f32_t, 2>(loss.capabilities, stream, {k, rows});
@@ -1251,8 +1251,7 @@ struct streamed_loss_t {
                 "zeroing summands");
         require(cudaMemsetAsync(self_coefficients.data(), 0, self_coefficients.numel() * sizeof(f32_t), cuda),
                 "zeroing coefficients");
-        launch(&prefix_inverse_norms_kernel, rows, block_threads_k, stream, queries, query_inverse_norms.span(),
-               ladder);
+        launch(&prefix_inverse_norms_cuda_, rows, block_threads_k, stream, queries, query_inverse_norms.span(), ladder);
     }
 
     /** Scores this rank's @p queries against @p candidates , whose first is @p candidate_base on
@@ -1263,10 +1262,10 @@ struct streamed_loss_t {
         require(cudaMemcpyAsync(staged_candidates.data(), candidates.data(), staged_candidates.numel() * sizeof(bf16_t),
                                 cudaMemcpyDefault, cuda_stream(stream)),
                 "candidate staging");
-        launch(&prefix_inverse_norms_kernel, rows, block_threads_k, stream, staged_candidates.view(),
+        launch(&prefix_inverse_norms_cuda_, rows, block_threads_k, stream, staged_candidates.view(),
                candidate_inverse_norms.span(), ladder);
         dim3 const transpose_grid {static_cast<std::uint32_t>(hidden / 32), static_cast<std::uint32_t>(rows / 32)};
-        launch(&transpose_kernel, transpose_grid, dim3 {32, 8}, stream, staged_candidates.view(),
+        launch(&transpose_cuda_, transpose_grid, dim3 {32, 8}, stream, staged_candidates.view(),
                transposed_candidates.span());
         std::uint32_t const tiles = static_cast<std::uint32_t>(rows / forward_side_k);
         forward_tile_t const tile {query_inverse_norms.view(),
@@ -1278,13 +1277,13 @@ struct streamed_loss_t {
                                    beta,
                                    bias,
                                    1.0f / live};
-        launch(&forward_tile_kernel, dim3 {tiles, tiles}, forward_threads_k, forward_shared_bytes_k, stream,
+        launch(&forward_tile_cuda_, dim3 {tiles, tiles}, forward_threads_k, forward_shared_bytes_k, stream,
                tensor_map_<2>(queries.data(), {hidden, rows}, {forward_depth_k, forward_side_k}),
                tensor_map_<2>(staged_candidates.data(), {hidden, rows}, {forward_depth_k, forward_side_k}), tile,
                ladder);
-        launch(&fold_partials_kernel, divide_round_up(rows, block_threads_k), block_threads_k, stream,
+        launch(&fold_partials_cuda_, divide_round_up(rows, block_threads_k), block_threads_k, stream,
                row_partials.view(), summand_rows.span(), self_coefficients.span());
-        launch(&backward_tile_kernel, dim3 {static_cast<std::uint32_t>(hidden / backward_channels_k), tiles},
+        launch(&backward_tile_cuda_, dim3 {static_cast<std::uint32_t>(hidden / backward_channels_k), tiles},
                backward_threads_k, backward_shared_bytes_k, stream,
                tensor_map_<3>(similarity_gradients.data(), {rows, rows, ladder.count},
                               {forward_depth_k, forward_side_k, 1}),
@@ -1296,9 +1295,9 @@ struct streamed_loss_t {
      *  span. */
     void finish(nk::tensor_view<bf16_t, 2> queries, nk::tensor_span<bf16_t, 2> gradient_out,
                 nk::tensor_span<f32_t, 1> summands, nk::stream_t const &stream) noexcept {
-        launch(&finalize_kernel, rows, block_threads_k, stream, queries, query_inverse_norms.view(),
+        launch(&finalize_cuda_, rows, block_threads_k, stream, queries, query_inverse_norms.view(),
                self_coefficients.view(), query_gradient.view(), gradient_out, ladder);
-        launch(&sum_summands_kernel, 1, block_threads_k, stream, summand_rows.view(), summands);
+        launch(&sum_summands_cuda_, 1, block_threads_k, stream, summand_rows.view(), summands);
     }
 
   private:

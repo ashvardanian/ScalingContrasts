@@ -6,7 +6,7 @@
  *
  *      scalingcontrasts oracle [--rows R]               every local GPU against Float64
  *      scalingcontrasts simulate [--rows R] --gpus S    one rank of an S-GPU world
- *      scalingcontrasts box [--rows R]                  every local GPU, peers read in place
+ *      scalingcontrasts box [--rows R]                  every local GPU, peers staged over NVLink
  *      scalingcontrasts collectives [--max-mib M]       multimem barrier and reductions
  *      scalingcontrasts hosts [--rows R] --host H --hosts N --nics A,B,... --exchange DIR
  *                                                       every GPU of N hosts, one NIC per GPU
@@ -52,7 +52,7 @@ struct settings_t {
 }
 
 /** Fills one row of @p embeddings with keyed BF16 values in @b [-scale/2,scale/2). */
-static __global__ void keyed_embeddings_kernel(nk::tensor_span<bf16_t, 2> embeddings, std::uint64_t salt, f32_t scale) {
+static __global__ void keyed_embeddings_cuda_(nk::tensor_span<bf16_t, 2> embeddings, std::uint64_t salt, f32_t scale) {
     std::size_t const row = blockIdx.x, rows = embeddings.extent(0), hidden = embeddings.extent(1);
     for (std::size_t channel = threadIdx.x; channel < hidden; channel += blockDim.x) {
         std::uint64_t const bits = splitmix64((salt * rows + row) * hidden + channel);
@@ -67,15 +67,15 @@ static __global__ void keyed_embeddings_kernel(nk::tensor_span<bf16_t, 2> embedd
 }
 
 /** Fills @p payload with @ref keyed_integer values, whose sums are exact. */
-static __global__ void keyed_integers_kernel(nk::tensor_span<f32_t, 1> payload, std::size_t member,
-                                             std::size_t members) {
+static __global__ void keyed_integers_cuda_(nk::tensor_span<f32_t, 1> payload, std::size_t member,
+                                            std::size_t members) {
     std::size_t const scalar = blockIdx.x * std::size_t {blockDim.x} + threadIdx.x;
     if (scalar < payload.extent(0)) payload[scalar] = keyed_integer(scalar, member, members);
 }
 
 /** Fills @p payload with keyed fractions in @b [-1/2,1/2), whose sums round. */
-static __global__ void keyed_fractions_kernel(nk::tensor_span<f32_t, 1> payload, std::size_t member,
-                                              std::size_t members) {
+static __global__ void keyed_fractions_cuda_(nk::tensor_span<f32_t, 1> payload, std::size_t member,
+                                             std::size_t members) {
     std::size_t const scalar = blockIdx.x * std::size_t {blockDim.x} + threadIdx.x;
     if (scalar < payload.extent(0))
         payload[scalar] = static_cast<f32_t>(splitmix64(scalar * members + member) >> 40) * 0x1.0p-24f - 0.5f;
@@ -83,8 +83,8 @@ static __global__ void keyed_fractions_kernel(nk::tensor_span<f32_t, 1> payload,
 
 /** Counts into @p wrong the scalars of @b [begin,end) that differ from the sum of every member's
  *  keyed integers. */
-static __global__ void count_wrong_sums_kernel(nk::tensor_view<f32_t, 1> payload, std::size_t begin, std::size_t end,
-                                               std::size_t members, unsigned long long *wrong) {
+static __global__ void count_wrong_sums_cuda_(nk::tensor_view<f32_t, 1> payload, std::size_t begin, std::size_t end,
+                                              std::size_t members, unsigned long long *wrong) {
     std::size_t const scalar = begin + blockIdx.x * std::size_t {blockDim.x} + threadIdx.x;
     if (scalar >= end) return;
     f32_t expected = 0.0f;
@@ -95,8 +95,8 @@ static __global__ void count_wrong_sums_kernel(nk::tensor_view<f32_t, 1> payload
 }
 
 /** Counts into @p differing the scalars of @p actual whose bits differ from @p reference . */
-static __global__ void count_differences_kernel(nk::tensor_view<f32_t, 1> actual, nk::tensor_view<f32_t, 1> reference,
-                                                unsigned long long *differing) {
+static __global__ void count_differences_cuda_(nk::tensor_view<f32_t, 1> actual, nk::tensor_view<f32_t, 1> reference,
+                                               unsigned long long *differing) {
     std::size_t const scalar = blockIdx.x * std::size_t {blockDim.x} + threadIdx.x;
     if (scalar >= actual.extent(0)) return;
     if (__float_as_uint(actual[scalar]) != __float_as_uint(reference[scalar]))
@@ -191,7 +191,7 @@ struct gpu_t {
     nk::stream_t stream = take(nk::stream_t::make(device), "stream");
     nk_capability_t const capabilities = take(device.capabilities_enabled(), "capabilities");
     auto embeddings = make_tensor<bf16_t, 2>(capabilities, stream, {settings.rows, settings.hidden});
-    launch(&keyed_embeddings_kernel, settings.rows, block_threads_k, stream, embeddings.span(), rank, scale);
+    launch(&keyed_embeddings_cuda_, settings.rows, block_threads_k, stream, embeddings.span(), rank, scale);
     auto gradient = make_tensor<bf16_t, 2>(capabilities, stream, {settings.rows, settings.hidden});
     streamed_loss_t loss = streamed_loss_t::make(
         device, stream, settings.rows, settings.hidden,
@@ -308,7 +308,7 @@ static void step_box(cluster_t &cluster, settings_t const &settings) noexcept {
 }
 
 /** Every local GPU's step across hosts: embeddings posted over the rails, local candidates scored
- *  while they fly, landed ones read in place over NVLink, then summands all-reduced over multimem
+ *  while they fly, landed ones staged over NVLink, then summands all-reduced over multimem
  *  and added across hosts in host order. A host posts only after draining its last step, so with
  *  two landings no write meets a reader. */
 static void step_hosts(cluster_t &cluster, settings_t const &settings) noexcept {
@@ -479,6 +479,7 @@ static int run_collectives(settings_t const &settings) noexcept {
     auto const barriers = [&] {
         for (gpu_t const &gpu : gpus) gpu.enter(), domain.barrier(gpu.local(), gpu.stream);
     };
+    barriers(), drain();
     timing_t const barrier = time_steps(barriers, drain, settings.windows, collective_calls_k);
     std::printf("barrier,%zu,%zu,%.2f,%.2f\n", count, domain.stride, barrier.min_ms * 1e3, barrier.median_ms * 1e3);
 
@@ -491,6 +492,7 @@ static int run_collectives(settings_t const &settings) noexcept {
         auto const reductions = [&] {
             for (gpu_t const &gpu : gpus) gpu.enter(), domain.all_reduce(gpu.local(), shard * count, gpu.stream);
         };
+        scatters(), reductions(), drain();
         timing_t const scatter = time_steps(scatters, drain, settings.windows, collective_calls_k);
         timing_t const reduce = time_steps(reductions, drain, settings.windows, collective_calls_k);
         f64_t const scatter_bandwidth = f64_t(bytes) / (scatter.min_ms * 1e6),
@@ -520,28 +522,28 @@ static int run_collectives(settings_t const &settings) noexcept {
     auto const all_reduce = [&] {
         for (gpu_t const &gpu : gpus) gpu.enter(), domain.all_reduce(gpu.local(), max_scalars, gpu.stream);
     };
-    fill(&keyed_integers_kernel);
+    fill(&keyed_integers_cuda_);
     for (gpu_t const &gpu : gpus) gpu.enter(), domain.reduce_scatter(gpu.local(), shard, gpu.stream);
     for (gpu_t const &gpu : gpus)
-        gpu.enter(), launch(&count_wrong_sums_kernel, blocks_for(shard), block_threads_k, gpu.stream,
-                            domain.payload(gpu.local()), gpu.local() * shard, gpu.local() * shard + shard, count,
-                            counters.data());
-    fill(&keyed_integers_kernel);
+        gpu.enter(),
+            launch(&count_wrong_sums_cuda_, blocks_for(shard), block_threads_k, gpu.stream, domain.payload(gpu.local()),
+                   gpu.local() * shard, gpu.local() * shard + shard, count, counters.data());
+    fill(&keyed_integers_cuda_);
     all_reduce();
     for (gpu_t const &gpu : gpus)
-        gpu.enter(), launch(&count_wrong_sums_kernel, blocks_for(max_scalars), block_threads_k, gpu.stream,
+        gpu.enter(), launch(&count_wrong_sums_cuda_, blocks_for(max_scalars), block_threads_k, gpu.stream,
                             domain.payload(gpu.local()), std::size_t(0), max_scalars, count, counters.data() + 1);
-    fill(&keyed_fractions_kernel);
+    fill(&keyed_fractions_cuda_);
     all_reduce();
     first.enter();
     require(cudaMemcpyAsync(reference.data(), domain.payload(0).data(), max_scalars * sizeof(f32_t),
                             cudaMemcpyDeviceToDevice, cuda_stream(first.stream)),
             "reference copy");
     for (std::size_t repeat = 1; repeat < settings.repeats; ++repeat) {
-        fill(&keyed_fractions_kernel);
+        fill(&keyed_fractions_cuda_);
         all_reduce();
         first.enter();
-        launch(&count_differences_kernel, blocks_for(max_scalars), block_threads_k, first.stream, domain.payload(0),
+        launch(&count_differences_cuda_, blocks_for(max_scalars), block_threads_k, first.stream, domain.payload(0),
                reference.view(), counters.data() + 2);
     }
     auto counted = make_tensor<unsigned long long, 1>(first.loss.capabilities, first.stream, {3},
@@ -572,9 +574,11 @@ int main(int argc, char **argv) {
                                             std::begin(modes), std::end(modes),
                                             [&](run_mode_t const &known) { return !std::strcmp(known.name, argv[1]); })
                                       : std::end(modes);
-    if (mode == std::end(modes))
-        return std::fprintf(stderr, "usage: %s oracle|simulate|box|hosts|collectives [--rows R] [--gpus S]\n", argv[0]),
-               2;
+    static constexpr char usage[] =
+        R"(usage: %s oracle|simulate|box|hosts|collectives [--rows R] [--hidden H] [--prefixes K]
+       [--gpus S] [--windows W] [--max-mib M] [--repeats N] [--host H --hosts N --nics A,B,... --exchange DIR]
+)";
+    if (mode == std::end(modes)) return std::fprintf(stderr, usage, argv[0]), 2;
     settings_t settings;
     for (int index = 2; index + 1 < argc; index += 2) {
         std::string_view const flag = argv[index];
@@ -582,6 +586,7 @@ int main(int argc, char **argv) {
         if (flag == "--nics") settings.nics = value;
         else if (flag == "--exchange") settings.exchange = value;
         else if (flag == "--rows") settings.rows = std::stoul(value);
+        else if (flag == "--hidden") settings.hidden = std::stoul(value);
         else if (flag == "--host") settings.host = std::stoul(value);
         else if (flag == "--hosts") settings.hosts = std::stoul(value);
         else if (flag == "--gpus") settings.simulated_gpus = std::stoul(value);

@@ -11,13 +11,17 @@ prefix of the embeddings, with BF16 embeddings and Float32 logits, as `scalingco
 Run one process per host:
 
     python baseline_jax.py --pairs 1024 --prefixes 5                                     # every local GPU
-    python baseline_jax.py --pairs 1024 --prefixes 5 --coordinator HOST:PORT --hosts 2 --host 0
+    python baseline_jax.py --pairs 1024 --prefixes 5 --coordinator <host 0>:<port> --hosts 2 --host 0
 
 Prints one CSV row from the first process:
 
     pairs,hidden,prefixes,world,impl,dtype,saved_bytes,peak_bytes,min_ms,median_ms
 
 `peak_bytes` is the first device's peak above the inputs; JAX keeps no saved tensors to report.
+
+File: baseline_jax.py
+Author: Ash Vardanian
+Date: October 22, 2026
 """
 
 import argparse

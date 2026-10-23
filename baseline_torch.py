@@ -17,6 +17,10 @@ Prints one CSV row:
 
 `saved_bytes` is what the forward leaves alive for the backward; `peak_bytes` is the step's peak above
 the inputs.
+
+File: baseline_torch.py
+Author: Ash Vardanian
+Date: October 22, 2026
 """
 
 import argparse
