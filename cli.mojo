@@ -1,6 +1,9 @@
-"""Benchmarks of the multimem primitives, each printing CSV rows.
+"""Benchmarks of the collectives and the streamed loss, each printing CSV rows.
 
-    scalingcontrasts_mojo collectives [--max-mib M] [--repeats R] [--windows W]
+    scalingcontrasts_mojo collectives [--max-mib M] [--repeats N] [--windows W]
+    scalingcontrasts_mojo box         [--rows R] [--hidden H] [--prefixes K] [--windows W]
+    scalingcontrasts_mojo simulate    [--rows R] --gpus S
+    scalingcontrasts_mojo oracle      [--rows R]
 
 The rows share their columns with the native binary's, so both backends' output pastes into one table.
 
@@ -10,22 +13,29 @@ Date: October 23, 2026
 """
 
 from std.builtin.sort import sort
-from std.sys import argv, has_nvidia_gpu_accelerator, size_of
+from std.math import exp, floor, log10, log1p, sqrt
+from std.sys import argv, size_of
 from std.time import perf_counter_ns
 
-from comm import MAX_GPUS, Signal
+from comm import Signal
 from comm.allreduce import allreduce
 from comm.sync import init_signal_buffer
 from layout import TileTensor, row_major
-from max.gpu.host import DeviceBuffer, DeviceContext
+from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 
 from scalingcontrasts import (
     BLOCK_THREADS,
+    Domain,
+    Matryoshka,
     MultimemDomain,
+    SUPPORTED_ACCELERATOR,
     Scalars,
+    StreamedLoss,
     count_differences_kernel,
     count_wrong_sums_kernel,
+    device_address,
     divide_round_up,
+    keyed_embeddings_kernel,
     keyed_fractions_kernel,
     keyed_integers_kernel,
 )
@@ -36,6 +46,26 @@ comptime COLLECTIVE_CALLS = 20
 comptime SMALLEST_SCALARS = 1 << 18
 """The payload of the smallest timed collective, one MiB of Float32."""
 
+comptime STEP_CALLS = 3
+"""Loss steps per timed window."""
+
+comptime SUMMAND_SCALARS = 4
+"""The loss's three summands, padded to one collective vector."""
+
+comptime BETA: Float32 = 10
+"""SigLIP's initial logit scale."""
+
+comptime BIAS: Float32 = -10
+"""SigLIP's initial logit bias."""
+
+comptime ORACLE_SCALE: Float32 = 1
+"""The scale of the oracle's embeddings, which keeps its narrowest prefixes off the cosine floor."""
+
+comptime BENCHMARK_SCALE: Float32 = 0.1
+"""The scale of the embeddings the benchmarks score."""
+
+comptime MULTICAST = DeviceContext.target.is_nvidia_gpu()
+"""Whether the domain reduces in an NVLink switch, rather than over peer reads."""
 
 # region Timing
 
@@ -115,6 +145,28 @@ def fixed(value: Float64, digits: Int) -> String:
     return String(t"{sign}{units // scale}.{fraction}")
 
 
+def scientific(value: Float64, digits: Int) -> String:
+    """Formats `value` with one integer digit, `digits` decimals and a signed two-digit exponent, the way `%.Ne` does.
+
+    Args:
+        value: The number to format.
+        digits: The decimals of the mantissa.
+
+    Returns:
+        The formatted number.
+    """
+    var exponent = 0 if value == 0 else Int(floor(log10(abs(value))))
+    var mantissa = value / 10.0**exponent
+    if abs(mantissa) * Float64(10**digits) + 0.5 >= Float64(10 ** (digits + 1)):
+        mantissa /= 10
+        exponent += 1
+    var sign = "-" if exponent < 0 else "+"
+    var magnitude = String(abs(exponent))
+    if magnitude.byte_length() < 2:
+        magnitude = "0" + magnitude
+    return String(t"{fixed(mantissa, digits)}e{sign}{magnitude}")
+
+
 def bandwidth_row(name: String, members: Int, bytes: Int, timing: Timing, bus_factor: Float64) -> String:
     """One bandwidth row: latencies in microseconds, then algorithm and bus bandwidths in GB/s.
 
@@ -143,7 +195,7 @@ def bandwidth_row(name: String, members: Int, bytes: Int, timing: Timing, bus_fa
 
 def fill[
     KeyedKernel: def(Scalars, Int64, Int64, Int64) thin -> None
-](contexts: List[DeviceContext], domain: MultimemDomain, scalars: Int) raises:
+](contexts: List[DeviceContext], domain: Domain, scalars: Int) raises:
     """Fills every member's payload with its keyed values.
 
     Parameters:
@@ -170,16 +222,16 @@ def fill[
 
 def run_max_all_reduce[
     Members: Int
-](contexts: List[DeviceContext], domain: MultimemDomain, max_scalars: Int, windows: Int) raises:
-    """Bus bandwidths of MAX's own multimem all-reduce over the same payloads, out of place into one buffer per
-    member.
+](contexts: List[DeviceContext], domain: Domain, max_scalars: Int, windows: Int) raises:
+    """Bus bandwidths of MAX's own all-reduce over the same payloads, out of place into one buffer per member: its
+    multimem path on NVIDIA, its peer-to-peer path on AMD.
 
     Parameters:
         Members: The count of GPUs, which MAX fixes at compile time.
 
     Args:
         contexts: One context per member.
-        domain: The domain whose multicast payload is the input.
+        domain: The domain whose payloads are the input.
         max_scalars: The largest payload to time.
         windows: The count of timed windows per payload.
 
@@ -189,7 +241,7 @@ def run_max_all_reduce[
     var signals = List[DeviceBuffer[DType.uint8]]()
     var outputs = List[DeviceBuffer[DType.float32]]()
     var output_addresses = List[Scalars]()
-    var rank_signals = Array[Pointer[Signal, MutAnyOrigin], MAX_GPUS](uninitialized=True)
+    var rank_signals = Array[MutPointer[Signal, MutAnyOrigin], Members](uninitialized=True)
     for member in range(Members):
         signals.append(contexts[member].create_buffer_sync[DType.uint8](size_of[Signal]() + max_scalars * 4))
         outputs.append(contexts[member].enqueue_create_buffer[DType.float32](max_scalars))
@@ -203,12 +255,19 @@ def run_max_all_reduce[
     while scalars <= max_scalars:
         var elements = scalars // Members // 4 * 4 * Members
         comptime Input = TileTensor[DType.float32, type_of(row_major(elements)), ImmutAnyOrigin]
-        var inputs = Array[Input, 1](uninitialized=True)
-        inputs[0] = Input(rebind[Pointer[Float32, ImmutAnyOrigin]](domain.multicast_payload(0)), row_major(elements))
+        var inputs = Array[Input, 1 if MULTICAST else Members](uninitialized=True)
+        comptime if MULTICAST:
+            var multicast = rebind[MultimemDomain](domain).multicast_payload(0)
+            inputs[0] = Input(rebind[Pointer[Float32, ImmutAnyOrigin]](multicast), row_major(elements))
+        else:
+            comptime for member in range(Members):
+                inputs[member] = Input(
+                    rebind[Pointer[Float32, ImmutAnyOrigin]](domain.payload(member)), row_major(elements)
+                )
 
         def reductions() raises {imm} -> None:
             comptime for member in range(Members):
-                allreduce[ngpus=Members, use_multimem=True](
+                allreduce[ngpus=Members, use_multimem=MULTICAST](
                     inputs,
                     TileTensor(output_addresses[member], row_major(elements)),
                     rank_signals,
@@ -240,14 +299,15 @@ def run_collectives(max_mib: Int, repeats: Int, windows: Int) raises:
     var contexts = List[DeviceContext]()
     for ordinal in range(count):
         contexts.append(DeviceContext(device_id=ordinal))
-    for context in contexts:
-        if not context.supports_multicast():
-            print(t"no multicast-capable GPU: {context.name()} has no NVLink multicast, skipping the collectives")
-            return
+    comptime if MULTICAST:
+        for context in contexts:
+            if not context.supports_multicast():
+                print(t"no multicast-capable GPU: {context.name()} has no NVLink multicast, skipping the collectives")
+                return
     DeviceContext.enable_all_peer_access()
 
     var max_scalars = max_mib << 18
-    var domain = MultimemDomain(contexts, max_scalars)
+    var domain = Domain(contexts, max_scalars)
 
     def barriers() raises {imm} -> None:
         for member in range(count):
@@ -343,6 +403,300 @@ def run_collectives(max_mib: Int, repeats: Int, windows: Int) raises:
 # endregion Collectives
 
 
+# region Loss
+
+
+@fieldwise_init
+struct Settings(Copyable, Movable):
+    """The flags every mode reads."""
+
+    var rows: Int
+    """The rows of every GPU's embeddings."""
+    var hidden: Int
+    """The channels of every embedding."""
+    var prefixes: Int
+    """The count of Matryoshka prefixes."""
+    var gpus: Int
+    """The GPUs a simulated world spans."""
+    var windows: Int
+    """The count of timed windows."""
+    var max_mib: Int
+    """The largest collective payload in MiB."""
+    var repeats: Int
+    """The all-reduces whose bits must all match the first."""
+
+
+struct Box(Movable):
+    """Every local GPU with peer access to the others: its keyed embeddings, their gradient, its loss, and the domain
+    every GPU's summands all-reduce over."""
+
+    var contexts: List[DeviceContext]
+    """One context per GPU, in device order."""
+    var embeddings: List[DeviceBuffer[DType.bfloat16]]
+    """Each GPU's keyed embeddings, `[rows, hidden]`."""
+    var gradients: List[DeviceBuffer[DType.bfloat16]]
+    """Each GPU's gradient of its embeddings, `[rows, hidden]`."""
+    var losses: List[StreamedLoss]
+    """Each GPU's loss."""
+    var domain: Domain
+    """The domain the summands all-reduce over."""
+    var rows: Int
+    """The rows of every GPU's embeddings."""
+
+    def __init__(out self, settings: Settings, scale: Float32) raises:
+        """Keys every local GPU's embeddings, allocates its loss, and binds the domain.
+
+        Args:
+            settings: The rows, channels and prefixes.
+            scale: The width of the embeddings' range.
+
+        Raises:
+            When an allocation, a launch or the domain's binding fails.
+        """
+        var count = DeviceContext.number_of_devices()
+        self.contexts = List[DeviceContext]()
+        self.embeddings = List[DeviceBuffer[DType.bfloat16]]()
+        self.gradients = List[DeviceBuffer[DType.bfloat16]]()
+        self.losses = List[StreamedLoss]()
+        self.rows = settings.rows
+        for ordinal in range(count):
+            var context = DeviceContext(device_id=ordinal)
+            var embeddings = context.enqueue_create_buffer[DType.bfloat16](settings.rows * settings.hidden)
+            context.enqueue_function[keyed_embeddings_kernel](
+                device_address(embeddings),
+                Int64(settings.rows),
+                Int64(settings.hidden),
+                UInt64(ordinal),
+                scale,
+                grid_dim=settings.rows,
+                block_dim=BLOCK_THREADS,
+            )
+            self.contexts.append(context)
+            self.embeddings.append(embeddings)
+            self.gradients.append(context.enqueue_create_buffer[DType.bfloat16](settings.rows * settings.hidden))
+            self.losses.append(
+                StreamedLoss(context, rows=settings.rows, hidden=settings.hidden, prefixes=settings.prefixes)
+            )
+        DeviceContext.enable_all_peer_access()
+        self.domain = Domain(self.contexts, SUMMAND_SCALARS)
+
+
+def step_box(box: Box) raises:
+    """Every local GPU's step: a barrier once all embeddings are complete, the peers' read in place, each candidate
+    block streamed and folded, then one all-reduce of the summands, whose barriers end the peer reads. Every barrier
+    is enqueued before any work, as a kernel's first, lazily loaded launch waits for its device to idle, which a
+    barrier spinning on a GPU not yet enqueued never does.
+
+    Args:
+        box: The GPUs to step.
+
+    Raises:
+        When a copy or a launch fails.
+    """
+    var count = len(box.contexts)
+    for member in range(count):
+        box.domain.barrier(member)
+    for member in range(count):
+        ref loss = box.losses[member]
+        var queries = device_address(box.embeddings[member])
+        loss.begin(queries)
+        for peer in range(count):
+            loss.score(
+                queries,
+                device_address(box.embeddings[peer]),
+                query_base=member * box.rows,
+                candidate_base=peer * box.rows,
+                beta=BETA,
+                bias=BIAS,
+                live=Float32(count * box.rows),
+            )
+        loss.finish(queries, device_address(box.gradients[member]), box.domain.payload(member))
+        box.domain.all_reduce(member, SUMMAND_SCALARS)
+
+
+def oracle_loss(
+    embeddings: List[Float64], queries: Int, hidden: Int, ladder: Matryoshka, mut gradient: List[Float64]
+) -> Float64:
+    """The world's Float64 loss and every query's gradient: the sum over prefixes and cells of
+    `w * softplus(-t * (beta * cos + b))`.
+
+    Args:
+        embeddings: Every query of the world, `[queries, hidden]`.
+        queries: The count of queries.
+        hidden: The channels of every query.
+        ladder: The prefixes.
+        gradient: The gradient of every query, `[queries, hidden]`, overwritten.
+
+    Returns:
+        The loss.
+    """
+    for index in range(queries * hidden):
+        gradient[index] = 0
+    var beta = Float64(BETA)
+    var bias = Float64(BIAS)
+    var weight = 1.0 / Float64(queries)
+    var loss = 0.0
+    var norms = List[Float64](length=queries, fill=0)
+    for band in range(ladder.prefixes()):
+        var width = ladder.end(band)
+        for i in range(queries):
+            var sum = 0.0
+            for h in range(width):
+                sum += embeddings[i * hidden + h] * embeddings[i * hidden + h]
+            norms[i] = sqrt(sum)
+        for i in range(queries):
+            for j in range(queries):
+                var dot = 0.0
+                for h in range(width):
+                    dot += embeddings[i * hidden + h] * embeddings[j * hidden + h]
+                var cosine = dot / (norms[i] * norms[j])
+                var target = 1.0 if i == j else -1.0
+                var signed_logit = target * (beta * cosine + bias)
+                loss += weight * (max(-signed_logit, 0.0) + log1p(exp(-abs(signed_logit))))
+                if i == j:
+                    continue
+                var cell_grad = weight * target * (1.0 / (1.0 + exp(-signed_logit)) - 1.0) * beta
+                for h in range(width):
+                    gradient[i * hidden + h] += cell_grad * (
+                        embeddings[j * hidden + h] / (norms[i] * norms[j])
+                        - cosine * embeddings[i * hidden + h] / (norms[i] * norms[i])
+                    )
+                    gradient[j * hidden + h] += cell_grad * (
+                        embeddings[i * hidden + h] / (norms[i] * norms[j])
+                        - cosine * embeddings[j * hidden + h] / (norms[j] * norms[j])
+                    )
+    return loss
+
+
+def run_simulate(settings: Settings) raises:
+    """One rank of a `--gpus` world on the first GPU, its own embeddings standing in for every candidate block.
+
+    Args:
+        settings: The rows, channels, prefixes, simulated GPUs and timed windows.
+
+    Raises:
+        When an allocation, a launch or a drain fails.
+    """
+    var context = DeviceContext()
+    var embeddings = context.enqueue_create_buffer[DType.bfloat16](settings.rows * settings.hidden)
+    var gradient = context.enqueue_create_buffer[DType.bfloat16](settings.rows * settings.hidden)
+    var summands = context.enqueue_create_buffer[DType.float32](SUMMAND_SCALARS)
+    var queries = device_address(embeddings)
+    context.enqueue_function[keyed_embeddings_kernel](
+        queries,
+        Int64(settings.rows),
+        Int64(settings.hidden),
+        UInt64(0),
+        BENCHMARK_SCALE,
+        grid_dim=settings.rows,
+        block_dim=BLOCK_THREADS,
+    )
+    var loss = StreamedLoss(context, rows=settings.rows, hidden=settings.hidden, prefixes=settings.prefixes)
+
+    def step() raises {imm} -> None:
+        loss.begin(queries)
+        for candidate_block in range(settings.gpus):
+            loss.score(
+                queries,
+                queries,
+                query_base=0,
+                candidate_base=candidate_block * settings.rows,
+                beta=BETA,
+                bias=BIAS,
+                live=Float32(settings.gpus * settings.rows),
+            )
+        loss.finish(queries, device_address(gradient), device_address(summands))
+
+    var contexts: List[DeviceContext] = [context]
+    step()
+    drain(contexts)
+    var timing = time_steps(step, contexts, settings.windows, STEP_CALLS)
+    print(
+        t"simulate,{settings.rows},{settings.hidden},{settings.prefixes},{settings.gpus},{loss.bytes()},"
+        t"{fixed(timing.min_ms, 3)},{fixed(timing.median_ms, 3)}"
+    )
+
+
+def run_box(settings: Settings) raises:
+    """Every local GPU's step time, and the device bytes of one GPU's loss.
+
+    Args:
+        settings: The rows, channels, prefixes and timed windows.
+
+    Raises:
+        When the box cannot be built, or a launch or a drain fails.
+    """
+    var box = Box(settings, BENCHMARK_SCALE)
+
+    def step() raises {imm} -> None:
+        step_box(box)
+
+    step()
+    drain(box.contexts)
+    var timing = time_steps(step, box.contexts, settings.windows, STEP_CALLS)
+    print(
+        t"box,{settings.rows},{settings.hidden},{settings.prefixes},{len(box.contexts)},{box.losses[0].bytes()},"
+        t"{fixed(timing.min_ms, 3)},{fixed(timing.median_ms, 3)}"
+    )
+
+
+def run_oracle(settings: Settings) raises:
+    """One step against a Float64 evaluation of the whole world: every GPU's embeddings, gradient and summands, each
+    downloaded on its GPU's stream.
+
+    Args:
+        settings: The rows, channels and prefixes.
+
+    Raises:
+        When the box cannot be built, or a launch, a copy or a drain fails.
+    """
+    var box = Box(settings, ORACLE_SCALE)
+    step_box(box)
+    drain(box.contexts)
+    var count = len(box.contexts)
+    var elements = settings.rows * settings.hidden
+    var embeddings = List[HostBuffer[DType.bfloat16]]()
+    var gradients = List[HostBuffer[DType.bfloat16]]()
+    var summands = List[HostBuffer[DType.float32]]()
+    for member in range(count):
+        var context = box.contexts[member]
+        embeddings.append(context.enqueue_create_host_buffer[DType.bfloat16](elements))
+        gradients.append(context.enqueue_create_host_buffer[DType.bfloat16](elements))
+        summands.append(context.enqueue_create_host_buffer[DType.float32](3))
+        context.enqueue_copy(embeddings[member], box.embeddings[member])
+        context.enqueue_copy(gradients[member], box.gradients[member])
+        context.enqueue_copy(
+            summands[member], DeviceBuffer[DType.float32](context, box.domain.payload(member), 3, owning=False)
+        )
+    drain(box.contexts)
+
+    var world = List[Float64](length=count * elements, fill=0)
+    for member in range(count):
+        for index in range(elements):
+            world[member * elements + index] = embeddings[member][index].cast[DType.float64]()
+    var disagreeing = 0
+    for member in range(count):
+        disagreeing += Int(summands[member][0] != summands[0][0])
+    var exact = List[Float64](length=count * elements, fill=0)
+    var ladder = Matryoshka.halvings(settings.hidden, settings.prefixes)
+    var exact_loss = oracle_loss(world, count * settings.rows, settings.hidden, ladder, exact)
+    var difference = 0.0
+    var reference = 0.0
+    for member in range(count):
+        for index in range(elements):
+            var expected = exact[member * elements + index]
+            var delta = gradients[member][index].cast[DType.float64]() - expected
+            difference += delta * delta
+            reference += expected * expected
+    print(
+        t"oracle,{settings.rows},{settings.hidden},{settings.prefixes},{count},{fixed(exact_loss, 9)},"
+        t"{fixed(Float64(summands[0][0]), 9)},{scientific(sqrt(difference / reference), 3)},{disagreeing}"
+    )
+
+
+# endregion Loss
+
+
 # region Arguments
 
 
@@ -381,7 +735,7 @@ def reject_unknown_flags(args: Span[StaticString, ImmStaticOrigin]) raises:
     Raises:
         When a flag is not one the binary takes.
     """
-    var valued: List[String] = ["--max-mib", "--repeats", "--windows"]
+    var valued: List[String] = ["--rows", "--hidden", "--prefixes", "--gpus", "--windows", "--max-mib", "--repeats"]
     var index = 2
     while index < len(args):
         var argument = String(args[index])
@@ -397,18 +751,38 @@ def main() raises:
         When the command line is malformed or a run fails.
     """
     var args = argv()
-    if len(args) < 2 or String(args[1]) != "collectives":
-        raise Error("Usage: scalingcontrasts_mojo collectives [--max-mib M] [--repeats R] [--windows W]")
+    var modes: List[String] = ["collectives", "box", "simulate", "oracle"]
+    if len(args) < 2 or String(args[1]) not in modes:
+        raise Error(
+            "Usage: scalingcontrasts_mojo collectives|box|simulate|oracle [--rows R] [--hidden H] [--prefixes K]"
+            " [--gpus S] [--windows W] [--max-mib M] [--repeats N]"
+        )
     reject_unknown_flags(args)
-    var max_mib = parse_int_arg(args, "--max-mib", 128)
-    var repeats = parse_int_arg(args, "--repeats", 1000)
-    var windows = parse_int_arg(args, "--windows", 10)
-    if max_mib < 1 or repeats < 1 or windows < 1:
-        raise Error("Flags --max-mib, --repeats and --windows must be positive")
-    comptime if has_nvidia_gpu_accelerator() and DeviceContext.default_device_info.compute >= 9.0:
-        run_collectives(max_mib, repeats, windows)
+    var mode = String(args[1])
+    var settings = Settings(
+        rows=parse_int_arg(args, "--rows", 1024),
+        hidden=parse_int_arg(args, "--hidden", 1024),
+        prefixes=parse_int_arg(args, "--prefixes", 5),
+        gpus=parse_int_arg(args, "--gpus", 0),
+        windows=parse_int_arg(args, "--windows", 10),
+        max_mib=parse_int_arg(args, "--max-mib", 128),
+        repeats=parse_int_arg(args, "--repeats", 1000),
+    )
+    if settings.rows < 1 or settings.hidden < 1 or settings.windows < 1 or settings.max_mib < 1 or settings.repeats < 1:
+        raise Error("Flags --rows, --hidden, --windows, --max-mib and --repeats must be positive")
+    if mode == "simulate" and settings.gpus < 1:
+        raise Error("Mode simulate needs a positive --gpus")
+    comptime if SUPPORTED_ACCELERATOR:
+        if mode == "collectives":
+            run_collectives(settings.max_mib, settings.repeats, settings.windows)
+        elif mode == "box":
+            run_box(settings)
+        elif mode == "simulate":
+            run_simulate(settings)
+        else:
+            run_oracle(settings)
     else:
-        print("no multicast-capable GPU: this build targets no NVIDIA GPU of sm_90 or newer, skipping the collectives")
+        print(t"no supported GPU: this build targets no Hopper, Blackwell, CDNA 4 or CDNA 5 GPU, skipping {mode}")
 
 
 # endregion Arguments

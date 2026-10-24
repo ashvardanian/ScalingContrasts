@@ -17,8 +17,8 @@ version = "0.1.0"
 
 # `mojo` ships separately from `max`, so pinning `max` alone does not pin the compiler.
 [dependencies]
-max = ">=26.6,<27"
-mojo = ">=1.1.0,<2"
+max = ">=26.7,<26.8"
+mojo = ">=1.2.0,<1.3"
 
 # `mojo build -o` writes into a directory but will not create one, and `build/` is ignored.
 [tasks]
@@ -26,3 +26,28 @@ prepare = "mkdir -p build"
 build-cli = { cmd = "mojo build cli.mojo -o build/scalingcontrasts_mojo", depends-on = ["prepare"] }
 bench = { cmd = "build/scalingcontrasts_mojo collectives", depends-on = ["build-cli"] }
 format = "clang-format -i *.cu *.cuh && mojo format -l 120 *.mojo && taplo format && uv run --no-sync ruff format *.py"
+
+# Cross-compiles for every target and greps each one's device assembly, which `DUMP_GPU_ASM` embeds as text
+# even where the kernels ship as AMD objects: switch reductions and an MMA on NVIDIA, MFMA or WMMA on AMD.
+[tasks.check]
+cmd = '''bash -euo pipefail -c '
+count() { { grep -oE "$2" "$1" || true; } | wc -l | tr -d " "; }
+for target in sm_90a sm_100a sm_103a gfx950 gfx1250; do
+  assembly=build/check-$target.s
+  mojo build -D DUMP_GPU_ASM=True --target-triple x86_64-unknown-linux-gnu --target-accelerator $target \
+    --emit asm cli.mojo -o $assembly
+  case $target in
+    sm_*) required="multimem\.ld_reduce multimem\.red mma\.sync|wgmma|tcgen05\.mma" forbidden="v_mfma|v_wmma" ;;
+    gfx950) required="v_mfma" forbidden="multimem\." ;;
+    gfx1250) required="v_wmma" forbidden="multimem\." ;;
+  esac
+  for pattern in $required; do
+    found=$(count $assembly "$pattern")
+    echo "$target,$pattern,$found"
+    [ "$found" -gt 0 ]
+  done
+  found=$(count $assembly "$forbidden")
+  echo "$target,no $forbidden,$found"
+  [ "$found" -eq 0 ]
+done''''
+depends-on = ["prepare"]
