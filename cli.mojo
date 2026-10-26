@@ -25,6 +25,7 @@ from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 
 from scalingcontrasts import (
     BLOCK_THREADS,
+    COSINE_FLOOR,
     Domain,
     Matryoshka,
     MultimemDomain,
@@ -549,11 +550,13 @@ def oracle_loss(
                 var dot = 0.0
                 for h in range(width):
                     dot += embeddings[i * hidden + h] * embeddings[j * hidden + h]
-                var cosine = dot / (norms[i] * norms[j])
+                var denominator = norms[i] * norms[j]
+                var active = denominator > Float64(COSINE_FLOOR)
+                var cosine = Float64(1) if i == j else dot / denominator if active else Float64(0)
                 var target = 1.0 if i == j else -1.0
                 var signed_logit = target * (beta * cosine + bias)
                 loss += weight * (max(-signed_logit, 0.0) + log1p(exp(-abs(signed_logit))))
-                if i == j:
+                if i == j or not active:
                     continue
                 var cell_grad = weight * target * (1.0 / (1.0 + exp(-signed_logit)) - 1.0) * beta
                 for h in range(width):
