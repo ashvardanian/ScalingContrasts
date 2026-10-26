@@ -900,7 +900,7 @@ comptime SHEET_STRIDE = TILE_SIDE + 1
 """Float32 scalars between the rows of the sheet a tile's rows are summed on."""
 
 comptime COSINE_FLOOR: Float32 = 1.0e-2
-"""The norm product below which a cosine reads as zero."""
+"""The norm product at or below which a cosine reads as zero."""
 
 comptime INVERSE_COSINE_FLOOR: Float32 = 1.0 / COSINE_FLOOR
 """The largest inverse norm product a cosine scales by."""
@@ -1324,7 +1324,7 @@ def prefix_inverse_norms_kernel(embeddings: Halves, norms: Scalars, rows: Int64,
         barrier()
         running += block.sum[block_size=BLOCK_THREADS, broadcast=False](partial)
         if thread_idx.x == 0:
-            norms[unsafe_offset=band * Int(rows) + row] = 1 / sqrt(running)
+            norms[unsafe_offset=band * Int(rows) + row] = 1 / sqrt(running) if running > 0 else Float32(0)
 
 
 def forward_tile_kernel(tile: ForwardTile, ladder: Matryoshka):
@@ -1401,7 +1401,8 @@ def forward_tile_kernel(tile: ForwardTile, ladder: Matryoshka):
             bias_grad += cell_grad
             log_beta_grad += cell_grad * logit
             # The mirror cell (j, i) moves v_i the same way, and the own copy moves nothing.
-            var raw_grad = own_copy.select(Cells(0), 2 * tile.beta * cell_grad * inverse_denominator)
+            var inactive = own_copy | inverse_denominator.ge(Cells(INVERSE_COSINE_FLOOR))
+            var raw_grad = inactive.select(Cells(0), 2 * tile.beta * cell_grad * inverse_denominator)
             suffix += raw_grad
             comptime for cell in range(TILE_CELLS):
                 tile.similarity_gradients[
@@ -1522,9 +1523,7 @@ def finalize_kernel(
         for band in range(ladder.prefixes()):
             if channel < ladder.end(band):
                 var inverse_norm = inverse_norms[unsafe_offset=band * Int(rows) + row]
-                fold += self_coefficients[unsafe_offset=band * Int(rows) + row] * min(
-                    inverse_norm * inverse_norm, INVERSE_COSINE_FLOOR
-                )
+                fold += self_coefficients[unsafe_offset=band * Int(rows) + row] * inverse_norm * inverse_norm
         var offset = row * Int(hidden) + channel
         gradient[unsafe_offset=offset] = (
             query_gradient[unsafe_offset=offset] - fold * queries[unsafe_offset=offset].cast[DType.float32]()

@@ -150,10 +150,13 @@ template <typename step_type_, typename drain_type_>
             for (std::size_t j = 0; j != queries; ++j) {
                 f64_t dot = 0;
                 for (std::size_t h = 0; h != width; ++h) dot += embeddings[i, h] * embeddings[j, h];
-                f64_t const cosine = dot / (norms[i] * norms[j]), target = i == j ? 1.0 : -1.0;
+                f64_t const denominator = norms[i] * norms[j];
+                bool const active = denominator > f64_t(cosine_floor_k);
+                f64_t const cosine = i == j ? 1.0 : active ? dot / denominator : 0.0;
+                f64_t const target = i == j ? 1.0 : -1.0;
                 f64_t const signed_logit = target * (beta * cosine + bias);
                 loss += weight * (std::fmax(-signed_logit, 0.0) + std::log1p(std::exp(-std::fabs(signed_logit))));
-                if (i == j) continue;
+                if (i == j || !active) continue;
                 f64_t const cell_grad = weight * target * (1.0 / (1.0 + std::exp(-signed_logit)) - 1.0) * beta;
                 for (std::size_t h = 0; h != width; ++h) {
                     gradient[i, h] += cell_grad * (embeddings[j, h] / (norms[i] * norms[j]) -

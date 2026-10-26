@@ -30,6 +30,7 @@ The Mojo module ports the single-box loss and collectives to Nvidia Hopper and B
 pixi run build-cli   # builds build/scalingcontrasts_mojo
 pixi run check       # cross-compiles for sm_90a, sm_100a, sm_103a, gfx950 and gfx1250
 pixi run bench
+pixi run test-normalization   # checks zero and small-vector gradients on one supported GPU
 ```
 
 Other Mojo projects import the module from a checkout, pointing the compiler at it:
