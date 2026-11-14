@@ -47,7 +47,7 @@ using f32_t = float;
 using f64_t = double;
 
 inline constexpr std::uint32_t block_threads_k = 256;
-inline constexpr f32_t cosine_floor_k = 1.0e-2f; // smaller norm products read as zero cosines
+inline constexpr f32_t cosine_floor_k = 1.0e-2f; // norm products at or below this read as zero cosines
 inline constexpr f32_t inverse_cosine_floor_k = 1.0f / cosine_floor_k;
 
 /** The smallest count of @p divisor -sized pieces that covers @p value . */
@@ -681,7 +681,7 @@ static __global__ void prefix_inverse_norms_cuda_(nk::tensor_view<bf16_t, 2> emb
             partial += value * value;
         }
         running += block_sum(partial);
-        if (threadIdx.x == 0) norms[band, row] = 1.0f / std::sqrt(running);
+        if (threadIdx.x == 0) norms[band, row] = running > 0.0f ? 1.0f / std::sqrt(running) : 0.0f;
     }
 }
 
@@ -888,7 +888,9 @@ __device__ inline void score_forward_row_(forward_tile_t const &tile, std::uint3
             summands.bias_grad += cell_grad;
             summands.log_beta_grad += cell_grad * logit;
             // The mirror cell (j, i) moves v_i the same way, and the own copy moves nothing.
-            f32_t const raw_grad = own_copy ? 0.0f : 2.0f * tile.beta * cell_grad * inverse_denominator;
+            f32_t const raw_grad = own_copy || inverse_denominator >= inverse_cosine_floor_k
+                                       ? 0.0f
+                                       : 2.0f * tile.beta * cell_grad * inverse_denominator;
             coefficient += raw_grad * similarities[cell];
             running[cell] += raw_grad;
             if (cell % 2)
@@ -1158,8 +1160,7 @@ static __global__ void finalize_cuda_(nk::tensor_view<bf16_t, 2> queries, nk::te
         f32_t fold = 0.0f;
         for (std::uint32_t band = 0; band != ladder.count; ++band)
             if (channel < ladder.ends[band])
-                fold += self_coefficients[band, row] *
-                        std::fmin(inverse_norms[band, row] * inverse_norms[band, row], inverse_cosine_floor_k);
+                fold += self_coefficients[band, row] * inverse_norms[band, row] * inverse_norms[band, row];
         gradient_out[row, channel] = __float2bfloat16(query_gradient[row, channel] -
                                                       fold * __bfloat162float(queries[row, channel]));
     }

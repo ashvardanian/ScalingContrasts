@@ -26,6 +26,7 @@ prepare = "mkdir -p build"
 build-cli = { cmd = "mojo build cli.mojo -o build/scalingcontrasts_mojo", depends-on = ["prepare"] }
 bench = { cmd = "build/scalingcontrasts_mojo collectives", depends-on = ["build-cli"] }
 format = "clang-format -i *.cu *.cuh && mojo format -l 120 *.mojo && taplo format && uv run --no-sync ruff format *.py"
+test-normalization = "mojo run test_normalization.mojo"
 
 # Cross-compiles for every target and greps each one's device assembly, which `DUMP_GPU_ASM` embeds as text
 # even where the kernels ship as AMD objects: switch reductions and an MMA on NVIDIA, MFMA or WMMA on AMD.
